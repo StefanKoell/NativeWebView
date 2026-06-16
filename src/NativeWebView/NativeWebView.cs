@@ -997,24 +997,7 @@ public class NativeWebView : NativeControlHost, IDisposable
             _isUsingSyntheticFrameSource = frame.IsSynthetic;
             _renderDiagnosticsMessage = null;
 
-            if (frame.IsSynthetic)
-            {
-                _renderStatisticsTracker.MarkCaptureSuccess(frame);
-                RaiseRenderFrameCaptured(frame);
-                return frame;
-            }
-
-            if (RenderMode == NativeWebViewRenderMode.GpuSurface)
-            {
-                UpdateGpuSurfaceFrame(frame);
-                DisposeOffscreenSurface();
-            }
-            else
-            {
-                UpdateOffscreenFrame(frame);
-                DisposeGpuSurface();
-            }
-
+            UpdateCapturedRenderSurface(frame);
             _renderStatisticsTracker.MarkCaptureSuccess(frame);
             RaiseRenderFrameCaptured(frame);
             InvalidateVisual();
@@ -1036,6 +1019,38 @@ public class NativeWebView : NativeControlHost, IDisposable
         {
             _frameCaptureInProgress = false;
         }
+    }
+
+    private void UpdateCapturedRenderSurface(NativeWebViewRenderFrame frame)
+    {
+        if (frame.IsSynthetic && HasRetainedCompositedFrame(RenderMode))
+        {
+            return;
+        }
+
+        if (RenderMode == NativeWebViewRenderMode.GpuSurface)
+        {
+            UpdateGpuSurfaceFrame(frame);
+            if (!frame.IsSynthetic)
+            {
+                DisposeOffscreenSurface();
+            }
+        }
+        else
+        {
+            UpdateOffscreenFrame(frame);
+            if (!frame.IsSynthetic)
+            {
+                DisposeGpuSurface();
+            }
+        }
+    }
+
+    private bool HasRetainedCompositedFrame(NativeWebViewRenderMode renderMode)
+    {
+        return renderMode == NativeWebViewRenderMode.GpuSurface
+            ? _gpuSurfaceBitmap is not null || _offscreenBitmap is not null
+            : _offscreenBitmap is not null || _gpuSurfaceBitmap is not null;
     }
 
     private async Task<NativeWebViewRenderFrame?> CaptureFrameCoreAsync(
