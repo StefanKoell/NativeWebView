@@ -119,6 +119,38 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
 
     public IntPtr ConfigurationHandle { get; private set; }
 
+    public void AttachToParent(IPlatformHandle parent)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(parent);
+
+        if (parent.Handle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Parent native handle is invalid.");
+        }
+
+        ObjC.SendVoid(ViewHandle, NativeSymbols.SelRemoveFromSuperview);
+        ObjC.SendVoidIntPtr(parent.Handle, NativeSymbols.SelAddSubview, ViewHandle);
+        ObjC.SendVoidNUInt(ViewHandle, NativeSymbols.SelSetAutoresizingMask, NSViewWidthSizable | NSViewHeightSizable);
+        UpdateLayoutForCurrentMode();
+    }
+
+    public void DetachFromParent(bool preserveRuntime)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (!preserveRuntime)
+        {
+            Dispose();
+            return;
+        }
+
+        if (ViewHandle != IntPtr.Zero)
+        {
+            ObjC.SendVoid(ViewHandle, NativeSymbols.SelRemoveFromSuperview);
+        }
+    }
+
     public bool SupportsRenderMode(NativeWebViewRenderMode renderMode)
     {
         return renderMode is NativeWebViewRenderMode.GpuSurface or NativeWebViewRenderMode.Offscreen;
@@ -448,15 +480,6 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         ObjC.SendVoidCGRect(ViewHandle, NativeSymbols.SelSetFrame, bounds);
     }
 
-    private void PlaceOffscreen()
-    {
-        var offscreenRect = new CGRect(
-            new CGPoint(-10000, -10000),
-            new CGSize(Math.Max(1, _capturePixelWidth), Math.Max(1, _capturePixelHeight)));
-
-        ObjC.SendVoidCGRect(ViewHandle, NativeSymbols.SelSetFrame, offscreenRect);
-    }
-
     private double GetBackingScaleFactor()
     {
         var window = ObjC.SendIntPtr(ViewHandle, NativeSymbols.SelWindow);
@@ -673,8 +696,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         }
 
         if (normalized.Contains("://", StringComparison.Ordinal) &&
-            Uri.TryCreate(normalized, UriKind.Absolute, out var normalizedUri) &&
-            normalizedUri is not null)
+            Uri.TryCreate(normalized, UriKind.Absolute, out var normalizedUri))
         {
             normalized = normalizedUri.Host;
         }

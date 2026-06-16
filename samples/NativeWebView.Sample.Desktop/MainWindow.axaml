@@ -490,6 +490,64 @@
       <TabItem Header="State">
         <TextBox x:Name="StateSummaryBox" AcceptsReturn="True" IsReadOnly="True" TextWrapping="Wrap" ScrollViewer.VerticalScrollBarVisibility="Auto" />
       </TabItem>
+      <TabItem Header="Preservation">
+        <Grid RowDefinitions="Auto,Auto,*" Margin="8" RowSpacing="8">
+          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+            <TextBox
+                x:Name="PreservationUrlTextBox"
+                Height="34"
+                VerticalContentAlignment="Center"
+                PlaceholderText="URL for preserved instance" />
+            <Button
+                Grid.Column="1"
+                MinWidth="42"
+                Click="LoadPreservedInstanceButtonOnClick"
+                ToolTip.Tip="Load">
+              <fi:SymbolIcon Symbol="ArrowEnter" />
+            </Button>
+          </Grid>
+
+          <WrapPanel Grid.Row="1" Orientation="Horizontal">
+            <Button Margin="0,0,6,6" Click="MovePreservedPresenterButtonOnClick" ToolTip.Tip="Move presenter">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <fi:SymbolIcon Symbol="ArrowRight" />
+                <TextBlock VerticalAlignment="Center" Text="Move" />
+              </StackPanel>
+            </Button>
+            <Button Margin="0,0,6,6" Click="RecreatePreservedPresenterButtonOnClick" ToolTip.Tip="Replace presenter">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <fi:SymbolIcon Symbol="ArrowClockwise" />
+                <TextBlock VerticalAlignment="Center" Text="Replace" />
+              </StackPanel>
+            </Button>
+            <Button Margin="0,0,6,6" Click="CyclePreservedRenderModeButtonOnClick" ToolTip.Tip="Cycle render mode">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <fi:SymbolIcon Symbol="ArrowSync" />
+                <TextBlock VerticalAlignment="Center" Text="Cycle Mode" />
+              </StackPanel>
+            </Button>
+            <TextBlock
+                x:Name="PreservationStatusTextBlock"
+                VerticalAlignment="Center"
+                TextWrapping="Wrap" />
+          </WrapPanel>
+
+          <Grid Grid.Row="2" RowDefinitions="*,*" RowSpacing="8">
+            <Border BorderBrush="#3D4650" BorderThickness="1" CornerRadius="4">
+              <Grid RowDefinitions="Auto,*">
+                <TextBlock Margin="8,6" FontWeight="SemiBold" Text="Slot A" />
+                <ContentControl x:Name="PreservationPrimaryHost" Grid.Row="1" />
+              </Grid>
+            </Border>
+            <Border Grid.Row="1" BorderBrush="#3D4650" BorderThickness="1" CornerRadius="4">
+              <Grid RowDefinitions="Auto,*">
+                <TextBlock Margin="8,6" FontWeight="SemiBold" Text="Slot B" />
+                <ContentControl x:Name="PreservationSecondaryHost" Grid.Row="1" />
+              </Grid>
+            </Border>
+          </Grid>
+        </Grid>
+      </TabItem>
       <TabItem Header="Handles">
         <TextBox x:Name="HandleSummaryBox" AcceptsReturn="True" IsReadOnly="True" TextWrapping="Wrap" ScrollViewer.VerticalScrollBarVisibility="Auto" />
       </TabItem>

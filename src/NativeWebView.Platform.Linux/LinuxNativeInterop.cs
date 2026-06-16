@@ -5,7 +5,7 @@ namespace NativeWebView.Platform.Linux;
 
 internal static class LinuxGtkDispatcher
 {
-    private static readonly object Gate = new();
+    private static readonly Lock Gate = new();
     private static Task<bool>? _startTask;
     private static int _gtkThreadId;
 
@@ -352,6 +352,9 @@ internal static class LinuxNativeInterop
 
     [DllImport(GtkName)]
     internal static extern void gtk_widget_show_all(IntPtr widget);
+
+    [DllImport(GtkName)]
+    internal static extern void gtk_widget_hide(IntPtr widget);
 
     [DllImport(GtkName)]
     internal static extern void gtk_widget_destroy(IntPtr widget);
@@ -717,7 +720,7 @@ internal static class LinuxNativeInterop
         return ConvertJavaScriptValueToJson(value);
     }
 
-    public static string? ConvertJavaScriptValueToJson(IntPtr value)
+    public static string ConvertJavaScriptValueToJson(IntPtr value)
     {
         if (value == IntPtr.Zero)
         {

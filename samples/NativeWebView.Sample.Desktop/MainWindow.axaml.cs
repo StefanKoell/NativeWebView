@@ -3,6 +3,7 @@ using System.IO;
 using System.Text;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using Avalonia.Threading;
 using NativeWebView.Auth;
 using NativeWebView.Core;
 using NativeWebView.Dialog;
@@ -10,6 +11,8 @@ using NativeWebView.Interop;
 using NativeWebView.Platform.Linux;
 using NativeWebView.Platform.Windows;
 using NativeWebView.Platform.macOS;
+using NativeWebViewControl = NativeWebView.Controls.NativeWebView;
+using NativeWebViewInstance = NativeWebView.Controls.NativeWebViewInstance;
 
 namespace NativeWebView.Sample.Desktop;
 
@@ -32,6 +35,11 @@ public partial class MainWindow : Window
     private string? _lastSavedFrameMetadataPath;
     private string? _lastLoadedFrameMetadataSummary;
     private bool? _manualCompositedPassthroughOverride;
+    private NativeWebViewInstance? _preservedInstance;
+    private NativeWebViewControl? _preservedPresenter;
+    private readonly List<NativeWebViewControl> _retiredPreservedPresenters = [];
+    private bool _preservedPresenterInPrimarySlot = true;
+    private int _preservedPresenterVersion;
 
     public MainWindow()
     {
@@ -47,6 +55,13 @@ public partial class MainWindow : Window
 
         _dialog?.Dispose();
         _authenticationBroker?.Dispose();
+        _preservedPresenter?.Dispose();
+        foreach (var presenter in _retiredPreservedPresenters)
+        {
+            presenter.Dispose();
+        }
+
+        _preservedInstance?.Dispose();
         WebViewControl.Dispose();
     }
 
@@ -117,6 +132,8 @@ public partial class MainWindow : Window
         AuthRequestUriTextBox.Text = "https://example.com/auth";
         AuthCallbackUriTextBox.Text = "https://example.com/callback";
         AuthResultTextBlock.Text = "Authentication result: (not run)";
+        PreservationUrlTextBox.Text = "https://example.com/";
+        PreservationStatusTextBlock.Text = "No preserved presenter.";
 
         HeaderTextBlock.Text = "NativeWebView Feature Explorer";
         DiagnosticsSummaryBox.Text = "Diagnostics not collected yet.";
@@ -136,6 +153,18 @@ public partial class MainWindow : Window
         _manualCompositedPassthroughOverride = null;
         ManagedOverlayPanel.IsVisible = false;
         ManagedOverlayTextBox.Text = string.Empty;
+    }
+
+    private static NativeWebViewInstanceConfiguration CreatePreservedInstanceConfiguration()
+    {
+        var configuration = new NativeWebViewInstanceConfiguration();
+        configuration.EnvironmentOptions.UserDataFolder = "./artifacts/sample-preserved-webview-userdata";
+        configuration.EnvironmentOptions.CacheFolder = "./artifacts/sample-preserved-webview-cache";
+        configuration.EnvironmentOptions.CookieDataFolder = "./artifacts/sample-preserved-webview-cookies";
+        configuration.EnvironmentOptions.SessionDataFolder = "./artifacts/sample-preserved-webview-session";
+        configuration.ControllerOptions.ProfileName = "sample-preserved-profile";
+        configuration.ControllerOptions.ScriptLocale = "en-US";
+        return configuration;
     }
 
     private void PopulateDiagnosticsSummary()
@@ -298,6 +327,157 @@ public partial class MainWindow : Window
         {
             await WebViewControl.InitializeAsync();
         }
+    }
+
+    private NativeWebViewInstance EnsurePreservedInstance()
+    {
+        _preservedInstance ??= new NativeWebViewInstance(CreatePreservedInstanceConfiguration());
+        return _preservedInstance;
+    }
+
+    private NativeWebViewControl EnsurePreservedPresenter()
+    {
+        if (_preservedPresenter is not null)
+        {
+            return _preservedPresenter;
+        }
+
+        _preservedPresenter = CreatePreservedPresenter();
+        PlacePreservedPresenter();
+        return _preservedPresenter;
+    }
+
+    private NativeWebViewControl CreatePreservedPresenter()
+    {
+        var presenter = new NativeWebViewControl(EnsurePreservedInstance())
+        {
+            RenderMode = WebViewControl.RenderMode,
+            RenderFramesPerSecond = WebViewControl.RenderFramesPerSecond,
+        };
+
+        AttachPreservedPresenterEvents(presenter);
+
+        _preservedPresenterVersion++;
+        return presenter;
+    }
+
+    private void AttachPreservedPresenterEvents(NativeWebViewControl presenter)
+    {
+        presenter.CoreWebView2Initialized += PreservedPresenter_CoreWebView2Initialized;
+        presenter.NavigationStarted += PreservedPresenter_NavigationStarted;
+        presenter.NavigationCompleted += PreservedPresenter_NavigationCompleted;
+    }
+
+    private void DetachPreservedPresenterEvents(NativeWebViewControl presenter)
+    {
+        presenter.CoreWebView2Initialized -= PreservedPresenter_CoreWebView2Initialized;
+        presenter.NavigationStarted -= PreservedPresenter_NavigationStarted;
+        presenter.NavigationCompleted -= PreservedPresenter_NavigationCompleted;
+    }
+
+    private void PreservedPresenter_CoreWebView2Initialized(object? sender, CoreWebViewInitializedEventArgs e)
+    {
+        _ = sender;
+        AddLog($"Preserved.CoreWebView2Initialized: success={e.IsSuccess}");
+    }
+
+    private void PreservedPresenter_NavigationStarted(object? sender, NativeWebViewNavigationStartedEventArgs e)
+    {
+        _ = sender;
+        AddLog($"Preserved.NavigationStarted: uri={e.Uri}");
+    }
+
+    private void PreservedPresenter_NavigationCompleted(object? sender, NativeWebViewNavigationCompletedEventArgs e)
+    {
+        _ = sender;
+        AddLog($"Preserved.NavigationCompleted: uri={e.Uri}, success={e.IsSuccess}");
+        UpdatePreservationStatus();
+    }
+
+    private void PlacePreservedPresenter()
+    {
+        if (_preservedPresenter is null)
+        {
+            PreservationPrimaryHost.Content = null;
+            PreservationSecondaryHost.Content = null;
+            UpdatePreservationStatus();
+            return;
+        }
+
+        if (_preservedPresenterInPrimarySlot)
+        {
+            PreservationSecondaryHost.Content = null;
+            PreservationPrimaryHost.Content = _preservedPresenter;
+        }
+        else
+        {
+            PreservationPrimaryHost.Content = null;
+            PreservationSecondaryHost.Content = _preservedPresenter;
+        }
+
+        UpdatePreservationStatus();
+    }
+
+    private async Task EnsurePreservedPresenterInitializedAsync()
+    {
+        var presenter = EnsurePreservedPresenter();
+        if (!presenter.IsInitialized)
+        {
+            await presenter.InitializeAsync();
+        }
+    }
+
+    private void ApplyPreservedRenderMode(NativeWebViewRenderMode renderMode)
+    {
+        if (_preservedPresenter is null)
+        {
+            return;
+        }
+
+        if (!_preservedPresenter.SupportsRenderMode(renderMode))
+        {
+            AddLog($"[Preserved] Render mode '{renderMode}' is not supported.");
+            return;
+        }
+
+        _preservedPresenter.RenderMode = renderMode;
+        UpdatePreservationStatus();
+    }
+
+    private NativeWebViewRenderMode GetNextPreservedRenderMode()
+    {
+        var current = _preservedPresenter?.RenderMode ?? WebViewControl.RenderMode;
+        var modes = new[]
+        {
+            NativeWebViewRenderMode.Embedded,
+            NativeWebViewRenderMode.GpuSurface,
+            NativeWebViewRenderMode.Offscreen,
+        };
+        var startIndex = Array.IndexOf(modes, current);
+
+        for (var offset = 1; offset <= modes.Length; offset++)
+        {
+            var candidate = modes[(Math.Max(0, startIndex) + offset) % modes.Length];
+            if (_preservedPresenter?.SupportsRenderMode(candidate) ?? WebViewControl.SupportsRenderMode(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return current;
+    }
+
+    private void UpdatePreservationStatus()
+    {
+        var slot = _preservedPresenterInPrimarySlot ? "A" : "B";
+        var state = _preservedInstance is null
+            ? "No instance"
+            : $"Instance: initialized={_preservedInstance.IsInitialized}, url={_preservedInstance.CurrentUrl?.ToString() ?? "<none>"}";
+        var presenter = _preservedPresenter is null
+            ? "Presenter: none"
+            : $"Presenter: v{_preservedPresenterVersion}, slot={slot}, mode={_preservedPresenter.RenderMode}";
+
+        PreservationStatusTextBlock.Text = $"{presenter}. {state}.";
     }
 
     private void SyncCheckBoxState()
@@ -864,6 +1044,80 @@ public partial class MainWindow : Window
         SetRenderMode(NativeWebViewRenderMode.Offscreen);
     }
 
+    private async void LoadPreservedInstanceButtonOnClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (!TryParseUri(PreservationUrlTextBox.Text, out var uri))
+            {
+                throw new InvalidOperationException("Enter an absolute URL.");
+            }
+
+            await EnsurePreservedPresenterInitializedAsync();
+            EnsurePreservedPresenter().Navigate(uri);
+            AddLog($"[Preserved] Navigate: {uri}");
+        }
+        catch (Exception ex)
+        {
+            AddLog($"[Preserved] Load: {FormatException(ex)}");
+        }
+        finally
+        {
+            UpdatePreservationStatus();
+        }
+    }
+
+    private void MovePreservedPresenterButtonOnClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            EnsurePreservedPresenter();
+            _preservedPresenterInPrimarySlot = !_preservedPresenterInPrimarySlot;
+            PlacePreservedPresenter();
+            AddLog($"[Preserved] Presenter moved to slot {(_preservedPresenterInPrimarySlot ? "A" : "B")}.");
+        }
+        catch (Exception ex)
+        {
+            AddLog($"[Preserved] Move: {FormatException(ex)}");
+        }
+    }
+
+    private async void RecreatePreservedPresenterButtonOnClick(object? sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var oldPresenter = _preservedPresenter;
+            _preservedPresenter = null;
+            PlacePreservedPresenter();
+
+            await Dispatcher.UIThread.InvokeAsync(static () => { }, DispatcherPriority.Render);
+            await Dispatcher.UIThread.InvokeAsync(static () => { }, DispatcherPriority.Background);
+
+            _preservedPresenter = CreatePreservedPresenter();
+            PlacePreservedPresenter();
+
+            if (oldPresenter is not null)
+            {
+                DetachPreservedPresenterEvents(oldPresenter);
+                _retiredPreservedPresenters.Add(oldPresenter);
+            }
+
+            AddLog($"[Preserved] Presenter replaced as v{_preservedPresenterVersion}.");
+        }
+        catch (Exception ex)
+        {
+            AddLog($"[Preserved] Replace: {FormatException(ex)}");
+        }
+    }
+
+    private void CyclePreservedRenderModeButtonOnClick(object? sender, RoutedEventArgs e)
+    {
+        EnsurePreservedPresenter();
+        var nextMode = GetNextPreservedRenderMode();
+        ApplyPreservedRenderMode(nextMode);
+        AddLog($"[Preserved] RenderMode cycled to {nextMode}.");
+    }
+
     private void BoostRenderFpsMenuItemOnClick(object? sender, RoutedEventArgs e)
     {
         ChangeRenderFps(delta: 5);
@@ -885,6 +1139,7 @@ public partial class MainWindow : Window
             }
 
             WebViewControl.RenderMode = renderMode;
+            ApplyPreservedRenderMode(renderMode);
         });
     }
 

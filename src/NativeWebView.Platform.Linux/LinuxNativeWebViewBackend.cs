@@ -12,9 +12,9 @@ public sealed class LinuxNativeWebViewBackend
       INativeWebViewInstanceConfigurationTarget,
       INativeWebViewNativeControlAttachment
 {
-    private static readonly NativePlatformHandle PlaceholderPlatformHandle = new((nint)0x3001, "XID");
-    private static readonly NativePlatformHandle PlaceholderViewHandle = new((nint)0x3002, "WebKitWebView");
-    private static readonly NativePlatformHandle PlaceholderControllerHandle = new((nint)0x3003, "WebKitSettings");
+    private static readonly NativePlatformHandle PlaceholderPlatformHandle = new(0x3001, "XID");
+    private static readonly NativePlatformHandle PlaceholderViewHandle = new(0x3002, "WebKitWebView");
+    private static readonly NativePlatformHandle PlaceholderControllerHandle = new(0x3003, "WebKitSettings");
     private const string ScriptMessageHandlerName = "nativewebview";
 
     private static readonly string JavaScriptBridgeSource = """
@@ -280,6 +280,14 @@ public sealed class LinuxNativeWebViewBackend
                 _ = TryInitializeRuntimeInBackgroundAsync();
             }
 
+            return;
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            _currentUrl = uri;
+            _pendingNavigationUri = uri;
+            _runtimeInitializationRequested = true;
             return;
         }
 
@@ -686,10 +694,23 @@ public sealed class LinuxNativeWebViewBackend
         {
             if (_parentWindowXid == parentHandle.Handle || _gtkWindow == parentHandle.Handle)
             {
+                ShowPreservedHostWindow();
                 return new NativePlatformHandle(_hostWindowXid, "XID");
             }
 
-            DetachFromNativeParent();
+            if (string.Equals(parentHandle.HandleDescriptor, "XID", StringComparison.OrdinalIgnoreCase))
+            {
+                LinuxGtkDispatcher.InvokeAsync(
+                    () => LinuxNativeInterop.AttachX11WindowToParent(_hostWindowXid, parentHandle.Handle),
+                    CancellationToken.None).GetAwaiter().GetResult();
+
+                _parentWindowXid = parentHandle.Handle;
+                _attachmentTcs.TrySetResult(true);
+                ShowPreservedHostWindow();
+                return new NativePlatformHandle(_hostWindowXid, "XID");
+            }
+
+            DetachFromNativeParent(preserveRuntime: false);
         }
 
         LinuxHostWindowHandle hostHandle;
@@ -738,7 +759,13 @@ public sealed class LinuxNativeWebViewBackend
     public void DetachFromNativeParent()
     {
         EnsureNotDisposed();
-        DetachFromNativeParentCore();
+        DetachFromNativeParentCore(preserveRuntime: false);
+    }
+
+    public void DetachFromNativeParent(bool preserveRuntime)
+    {
+        EnsureNotDisposed();
+        DetachFromNativeParentCore(preserveRuntime);
     }
 
     public void Dispose()
@@ -750,7 +777,7 @@ public sealed class LinuxNativeWebViewBackend
 
         try
         {
-            DetachFromNativeParentCore();
+            DetachFromNativeParentCore(preserveRuntime: false);
         }
         catch
         {
@@ -765,13 +792,45 @@ public sealed class LinuxNativeWebViewBackend
         _runtimeGate.Dispose();
     }
 
-    private void DetachFromNativeParentCore()
+    private void DetachFromNativeParentCore(bool preserveRuntime)
     {
+        if (preserveRuntime && _hostWindowXid != IntPtr.Zero)
+        {
+            HidePreservedHostWindow();
+            _parentWindowXid = IntPtr.Zero;
+            _attachmentTcs = CreatePendingAttachmentSource();
+            return;
+        }
+
         DestroyRuntimeHost();
         _parentWindowXid = IntPtr.Zero;
         _hostWindowXid = IntPtr.Zero;
         _ownsGtkWindow = false;
         _attachmentTcs = CreatePendingAttachmentSource();
+    }
+
+    private void HidePreservedHostWindow()
+    {
+        if (!OperatingSystem.IsLinux() || _gtkWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        LinuxGtkDispatcher.InvokeAsync(
+            () => LinuxNativeInterop.gtk_widget_hide(_gtkWindow),
+            CancellationToken.None).GetAwaiter().GetResult();
+    }
+
+    private void ShowPreservedHostWindow()
+    {
+        if (!OperatingSystem.IsLinux() || _gtkWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        LinuxGtkDispatcher.InvokeAsync(
+            () => LinuxNativeInterop.gtk_widget_show_all(_gtkWindow),
+            CancellationToken.None).GetAwaiter().GetResult();
     }
 
     private void DestroyRuntimeHost()

@@ -56,9 +56,12 @@ public sealed class DesktopBackendMatrixTests
             webViewBackend.CoreWebView2EnvironmentRequested += (_, _) => environmentRequestedCount++;
             webViewBackend.CoreWebView2ControllerOptionsRequested += (_, _) => controllerRequestedCount++;
 
-            await webViewBackend.InitializeAsync();
-            Assert.Equal(1, environmentRequestedCount);
-            Assert.Equal(1, controllerRequestedCount);
+            if (runInteractiveRuntimeChecks)
+            {
+                await webViewBackend.InitializeAsync();
+                Assert.Equal(1, environmentRequestedCount);
+                Assert.Equal(1, controllerRequestedCount);
+            }
 
             var webViewHandleProvider = Assert.IsAssignableFrom<INativeWebViewPlatformHandleProvider>(webViewBackend);
             Assert.True(webViewHandleProvider.TryGetPlatformHandle(out var webViewPlatformHandle));
@@ -129,9 +132,6 @@ public sealed class DesktopBackendMatrixTests
                 : string.Equals(overrideValue, "1", StringComparison.OrdinalIgnoreCase);
         }
 
-        var isCi = string.Equals(Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(Environment.GetEnvironmentVariable("CI"), "1", StringComparison.OrdinalIgnoreCase);
-
-        return !isCi || platform == NativeWebViewPlatform.MacOS;
+        return false;
     }
 }

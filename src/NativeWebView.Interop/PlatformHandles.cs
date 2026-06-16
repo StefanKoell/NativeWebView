@@ -33,4 +33,9 @@ public interface INativeWebViewNativeControlAttachment
     NativePlatformHandle AttachToNativeParent(NativePlatformHandle parentHandle);
 
     void DetachFromNativeParent();
+
+    void DetachFromNativeParent(bool preserveRuntime)
+    {
+        DetachFromNativeParent();
+    }
 }

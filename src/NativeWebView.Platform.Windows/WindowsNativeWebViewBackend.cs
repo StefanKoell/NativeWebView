@@ -16,6 +16,7 @@ public sealed class WindowsNativeWebViewBackend
       INativeWebViewNativeControlAttachment
 {
     private const int EInvalidArgHResult = unchecked((int)0x80070057);
+    private static readonly TimeSpan TransientReparentNavigationSuppressionWindow = TimeSpan.FromMilliseconds(750);
     internal const string ControllerOptionsFallbackOriginalExceptionDataKey =
         "NativeWebView.Windows.ControllerOptionsFallbackOriginalException";
     private static readonly TimeSpan[] ControllerCreationRetryDelays =
@@ -24,10 +25,10 @@ public sealed class WindowsNativeWebViewBackend
         TimeSpan.FromMilliseconds(350),
         TimeSpan.FromMilliseconds(750),
     ];
-    private static readonly NativePlatformHandle PlaceholderPlatformHandle = new((nint)0x1001, "HWND");
-    private static readonly NativePlatformHandle PlaceholderViewHandle = new((nint)0x1002, "ICoreWebView2");
-    private static readonly NativePlatformHandle PlaceholderControllerHandle = new((nint)0x1003, "ICoreWebView2Controller");
-    private static readonly object WindowClassGate = new();
+    private static readonly NativePlatformHandle PlaceholderPlatformHandle = new(0x1001, "HWND");
+    private static readonly NativePlatformHandle PlaceholderViewHandle = new(0x1002, "ICoreWebView2");
+    private static readonly NativePlatformHandle PlaceholderControllerHandle = new(0x1003, "ICoreWebView2Controller");
+    private static readonly Lock WindowClassGate = new();
     private static readonly Win32.WndProc ChildWindowProcDelegate = ChildWindowProc;
 
     private static ushort _childWindowClassAtom;
@@ -52,8 +53,11 @@ public sealed class WindowsNativeWebViewBackend
     private GCHandle _selfHandle;
     private nint _parentWindowHandle;
     private nint _childWindowHandle;
+    private nint _parkingWindowHandle;
     private nint _viewComHandle;
     private nint _controllerComHandle;
+    private int _lastAttachedWidth = 1;
+    private int _lastAttachedHeight = 1;
 
     private int _historyIndex = -1;
     private long _frameSequence;
@@ -72,6 +76,8 @@ public sealed class WindowsNativeWebViewBackend
     private bool _isZoomControlEnabled;
 
     private double _zoomFactor;
+    private DateTimeOffset _suppressSameUrlNavigationUntilUtc;
+    private bool _suppressNextSameUrlNavigationCompletion;
     private string? _headerString;
     private string? _userAgentString;
 
@@ -249,6 +255,14 @@ public sealed class WindowsNativeWebViewBackend
                 _ = TryInitializeRuntimeInBackgroundAsync();
             }
 
+            return;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            _currentUrl = uri;
+            _pendingNavigationUri = uri;
+            _runtimeInitializationRequested = true;
             return;
         }
 
@@ -650,10 +664,12 @@ public sealed class WindowsNativeWebViewBackend
         {
             if (_parentWindowHandle == parentHandle.Handle)
             {
+                ShowPreservedChildWindow();
                 return new NativePlatformHandle(_childWindowHandle, "HWND");
             }
 
-            DetachFromNativeParent();
+            ReparentPreservedChildWindow(parentHandle.Handle);
+            return new NativePlatformHandle(_childWindowHandle, "HWND");
         }
 
         EnsureChildWindowClassRegistered();
@@ -693,6 +709,7 @@ public sealed class WindowsNativeWebViewBackend
 
         _selfHandle = GCHandle.Alloc(this);
         Win32.SetWindowLongPtr(childHandle, Win32.WindowLongIndex.GWLP_USERDATA, GCHandle.ToIntPtr(_selfHandle));
+        ResizeChildWindowToParent();
         UpdateControllerBounds();
 
         if (_runtimeInitializationRequested)
@@ -706,7 +723,13 @@ public sealed class WindowsNativeWebViewBackend
     public void DetachFromNativeParent()
     {
         EnsureNotDisposed();
-        DetachFromNativeParentCore();
+        DetachFromNativeParentCore(preserveRuntime: false);
+    }
+
+    public void DetachFromNativeParent(bool preserveRuntime)
+    {
+        EnsureNotDisposed();
+        DetachFromNativeParentCore(preserveRuntime);
     }
 
     public void Dispose()
@@ -718,7 +741,7 @@ public sealed class WindowsNativeWebViewBackend
 
         try
         {
-            DetachFromNativeParentCore();
+            DetachFromNativeParentCore(preserveRuntime: false);
         }
         catch
         {
@@ -740,8 +763,17 @@ public sealed class WindowsNativeWebViewBackend
         _runtimeGate.Dispose();
     }
 
-    private void DetachFromNativeParentCore()
+    private void DetachFromNativeParentCore(bool preserveRuntime)
     {
+        if (preserveRuntime && _childWindowHandle != IntPtr.Zero)
+        {
+            HidePreservedChildWindow();
+            _parentWindowHandle = IntPtr.Zero;
+            _attachmentTcs = CreatePendingAttachmentSource();
+            return;
+        }
+
+        SyncNavigationSnapshotFromRuntime();
         DestroyRuntimeController();
 
         if (_childWindowHandle != IntPtr.Zero)
@@ -754,6 +786,8 @@ public sealed class WindowsNativeWebViewBackend
             }
         }
 
+        DestroyParkingWindow();
+
         if (_selfHandle.IsAllocated)
         {
             _selfHandle.Free();
@@ -762,6 +796,142 @@ public sealed class WindowsNativeWebViewBackend
         _childWindowHandle = IntPtr.Zero;
         _parentWindowHandle = IntPtr.Zero;
         _attachmentTcs = CreatePendingAttachmentSource();
+    }
+
+    private void ReparentPreservedChildWindow(nint parentWindowHandle)
+    {
+        if (_childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        SuppressTransientSameUrlNavigation();
+        _ = Win32.SetParent(_childWindowHandle, parentWindowHandle);
+
+        _parentWindowHandle = parentWindowHandle;
+        _attachmentTcs.TrySetResult(true);
+        ShowPreservedChildWindow();
+        ResizeChildWindowToParent();
+        UpdateControllerBounds();
+    }
+
+    private void HidePreservedChildWindow()
+    {
+        SyncNavigationSnapshotFromRuntime();
+
+        // Keep the child HWND parented while detached so WebView2 does not rebuild the page.
+        var parkingWindowHandle = EnsureParkingWindow();
+        if (parkingWindowHandle == IntPtr.Zero)
+        {
+            _ = Win32.ShowWindow(_childWindowHandle, Win32.ShowWindowCommand.Hide);
+            return;
+        }
+
+        ResizeParkingWindow();
+        _ = Win32.SetParent(_childWindowHandle, parkingWindowHandle);
+        _ = Win32.SetWindowPos(
+            _childWindowHandle,
+            IntPtr.Zero,
+            0,
+            0,
+            _lastAttachedWidth,
+            _lastAttachedHeight,
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+    }
+
+    private void ShowPreservedChildWindow()
+    {
+        SuppressTransientSameUrlNavigation();
+        _ = Win32.ShowWindow(_childWindowHandle, Win32.ShowWindowCommand.Show);
+        ResizeChildWindowToParent();
+        UpdateControllerBounds();
+    }
+
+    private nint EnsureParkingWindow()
+    {
+        if (_parkingWindowHandle != IntPtr.Zero && Win32.IsWindow(_parkingWindowHandle))
+        {
+            return _parkingWindowHandle;
+        }
+
+        EnsureChildWindowClassRegistered();
+
+        var instanceHandle = Win32.GetModuleHandle(null);
+        _parkingWindowHandle = Win32.CreateWindowEx(
+            0,
+            Win32.ChildWindowClassName,
+            string.Empty,
+            Win32.WindowStyles.WS_POPUP |
+            Win32.WindowStyles.WS_CLIPSIBLINGS |
+            Win32.WindowStyles.WS_CLIPCHILDREN,
+            -32000,
+            -32000,
+            _lastAttachedWidth,
+            _lastAttachedHeight,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            instanceHandle,
+            IntPtr.Zero);
+
+        return _parkingWindowHandle;
+    }
+
+    private void ResizeParkingWindow()
+    {
+        if (_parkingWindowHandle == IntPtr.Zero || !Win32.IsWindow(_parkingWindowHandle))
+        {
+            return;
+        }
+
+        _ = Win32.SetWindowPos(
+            _parkingWindowHandle,
+            IntPtr.Zero,
+            -32000,
+            -32000,
+            _lastAttachedWidth,
+            _lastAttachedHeight,
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+    }
+
+    private void DestroyParkingWindow()
+    {
+        if (_parkingWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (Win32.IsWindow(_parkingWindowHandle))
+        {
+            Win32.DestroyWindow(_parkingWindowHandle);
+        }
+
+        _parkingWindowHandle = IntPtr.Zero;
+    }
+
+    private void ResizeChildWindowToParent()
+    {
+        if (_childWindowHandle == IntPtr.Zero || _parentWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (!Win32.GetClientRect(_parentWindowHandle, out var rect))
+        {
+            return;
+        }
+
+        var width = Math.Max(1, rect.Right - rect.Left);
+        var height = Math.Max(1, rect.Bottom - rect.Top);
+        _lastAttachedWidth = width;
+        _lastAttachedHeight = height;
+        _ = Win32.SetWindowPos(
+            _childWindowHandle,
+            IntPtr.Zero,
+            0,
+            0,
+            width,
+            height,
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate | Win32.SetWindowPosFlags.ShowWindow);
     }
 
     private static TaskCompletionSource<bool> CreatePendingAttachmentSource()
@@ -1186,6 +1356,13 @@ public sealed class WindowsNativeWebViewBackend
     private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
         var uri = TryCreateUri(e.Uri);
+        if (ShouldSuppressTransientSameUrlNavigation(uri, e.IsRedirected))
+        {
+            e.Cancel = true;
+            _suppressNextSameUrlNavigationCompletion = true;
+            return;
+        }
+
         var forwarded = new NativeWebViewNavigationStartedEventArgs(uri, e.IsRedirected);
         NavigationStarted?.Invoke(this, forwarded);
         e.Cancel = forwarded.Cancel;
@@ -1193,11 +1370,48 @@ public sealed class WindowsNativeWebViewBackend
 
     private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
     {
+        if (_suppressNextSameUrlNavigationCompletion)
+        {
+            _suppressNextSameUrlNavigationCompletion = false;
+            SyncNavigationSnapshotFromRuntime();
+            return;
+        }
+
         SyncNavigationSnapshotFromRuntime();
         var uri = _currentUrl ?? TryCreateUri(_coreWebView?.Source);
         var statusCode = e.IsSuccess ? TryConvertHttpStatusCode(e.HttpStatusCode) : null;
         var error = e.IsSuccess ? null : e.WebErrorStatus.ToString();
         NavigationCompleted?.Invoke(this, new NativeWebViewNavigationCompletedEventArgs(uri, e.IsSuccess, statusCode, error));
+    }
+
+    private void SuppressTransientSameUrlNavigation()
+    {
+        // WebView2 can emit a same-URL navigation while a preserved HWND is reparented.
+        // Treat that as native-host churn, not page navigation.
+        _suppressSameUrlNavigationUntilUtc = DateTimeOffset.UtcNow.Add(TransientReparentNavigationSuppressionWindow);
+    }
+
+    private bool ShouldSuppressTransientSameUrlNavigation(Uri? uri, bool isRedirected)
+    {
+        if (isRedirected ||
+            uri is null ||
+            _currentUrl is null ||
+            DateTimeOffset.UtcNow > _suppressSameUrlNavigationUntilUtc)
+        {
+            return false;
+        }
+
+        return string.Equals(
+            NormalizeNavigationComparisonUri(uri),
+            NormalizeNavigationComparisonUri(_currentUrl),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeNavigationComparisonUri(Uri uri)
+    {
+        return uri.IsAbsoluteUri
+            ? uri.AbsoluteUri
+            : uri.ToString();
     }
 
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -1618,6 +1832,7 @@ public sealed class WindowsNativeWebViewBackend
 
         internal static class WindowStyles
         {
+            public const uint WS_POPUP = 0x80000000;
             public const uint WS_CHILD = 0x40000000;
             public const uint WS_VISIBLE = 0x10000000;
             public const uint WS_CLIPSIBLINGS = 0x04000000;
@@ -1628,6 +1843,20 @@ public sealed class WindowsNativeWebViewBackend
         {
             public const uint WM_SIZE = 0x0005;
             public const uint WM_SETFOCUS = 0x0007;
+        }
+
+        internal static class ShowWindowCommand
+        {
+            public const int Hide = 0;
+            public const int Show = 5;
+        }
+
+        [Flags]
+        internal enum SetWindowPosFlags : uint
+        {
+            NoZOrder = 0x0004,
+            NoActivate = 0x0010,
+            ShowWindow = 0x0040,
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1683,6 +1912,22 @@ public sealed class WindowsNativeWebViewBackend
 
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool DestroyWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr hWndInsertAfter,
+            int x,
+            int y,
+            int cx,
+            int cy,
+            SetWindowPosFlags uFlags);
 
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool GetClientRect(IntPtr hWnd, out Rect lpRect);

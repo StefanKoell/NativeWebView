@@ -1,7 +1,5 @@
 using System.Globalization;
-using System.IO;
 using System.Runtime.InteropServices;
-using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Media;
@@ -38,11 +36,14 @@ public class NativeWebView : NativeControlHost, IDisposable
         "netflix.com",
     ];
 
+    private readonly NativeWebViewInstance _instance;
+    private readonly bool _ownsInstance;
     private readonly NativeWebViewController _controller;
     private readonly NativeWebViewRenderStatisticsTracker _renderStatisticsTracker = new();
+    private static long s_nextPresenterId;
 
-    private NativeWebViewInstanceConfiguration _instanceConfiguration;
     private MacOSNativeWebViewHost? _macOSHost;
+    private readonly long _presenterId = Interlocked.Increment(ref s_nextPresenterId);
     private DispatcherTimer? _framePump;
     private WriteableBitmap? _gpuSurfaceBitmap;
     private WriteableBitmap? _offscreenBitmap;
@@ -62,24 +63,36 @@ public class NativeWebView : NativeControlHost, IDisposable
         AvaloniaProperty.Register<NativeWebView, int>(nameof(RenderFramesPerSecond), DefaultRenderFramesPerSecond);
 
     public NativeWebView()
-        : this(CreateDefaultBackend(), instanceConfiguration: null)
+        : this(new NativeWebViewInstance(), ownsInstance: true)
     {
     }
 
     public NativeWebView(NativeWebViewInstanceConfiguration instanceConfiguration)
-        : this(CreateDefaultBackend(), instanceConfiguration)
+        : this(new NativeWebViewInstance(instanceConfiguration), ownsInstance: true)
     {
     }
 
     public NativeWebView(INativeWebViewBackend backend)
-        : this(backend, instanceConfiguration: null)
+        : this(new NativeWebViewInstance(backend), ownsInstance: true)
     {
     }
 
     public NativeWebView(INativeWebViewBackend backend, NativeWebViewInstanceConfiguration? instanceConfiguration)
+        : this(new NativeWebViewInstance(backend, instanceConfiguration), ownsInstance: true)
     {
-        _controller = new NativeWebViewController(backend);
-        _instanceConfiguration = instanceConfiguration?.Clone() ?? new NativeWebViewInstanceConfiguration();
+    }
+
+    public NativeWebView(NativeWebViewInstance instance)
+        : this(instance, ownsInstance: false)
+    {
+    }
+
+    private NativeWebView(NativeWebViewInstance instance, bool ownsInstance)
+    {
+        _instance = instance ?? throw new ArgumentNullException(nameof(instance));
+        _ownsInstance = ownsInstance;
+        _controller = _instance.Controller;
+        _macOSHost = _instance.MacOSHost;
         _controller.CoreWebView2EnvironmentRequested += OnCoreWebView2EnvironmentRequestedInternal;
         _controller.CoreWebView2ControllerOptionsRequested += OnCoreWebView2ControllerOptionsRequestedInternal;
         ApplyInstanceConfigurationToBackend();
@@ -93,11 +106,11 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     public NativeWebViewInstanceConfiguration InstanceConfiguration
     {
-        get => _instanceConfiguration;
+        get => _instance.InstanceConfiguration;
         set
         {
             ArgumentNullException.ThrowIfNull(value);
-            _instanceConfiguration = value.Clone();
+            _instance.ApplyInstanceConfiguration(value);
             ApplyInstanceConfigurationToBackend();
         }
     }
@@ -394,7 +407,7 @@ public class NativeWebView : NativeControlHost, IDisposable
 
             var metadataPath = string.IsNullOrWhiteSpace(metadataOutputPath)
                 ? $"{Path.GetFullPath(outputPath)}.json"
-                : metadataOutputPath!;
+                : metadataOutputPath;
 
             var metadata = NativeWebViewRenderFrameMetadataSerializer.Create(
                 frame,
@@ -620,11 +633,9 @@ public class NativeWebView : NativeControlHost, IDisposable
         }
 
         var destinationRect = new Rect(Bounds.Size);
-        context.FillRectangle(RenderBackgroundBrush, destinationRect);
-
         var surface = RenderMode == NativeWebViewRenderMode.GpuSurface
-            ? _gpuSurfaceBitmap
-            : _offscreenBitmap;
+            ? _gpuSurfaceBitmap ?? _offscreenBitmap
+            : _offscreenBitmap ?? _gpuSurfaceBitmap;
 
         if (surface is not null)
         {
@@ -633,15 +644,32 @@ public class NativeWebView : NativeControlHost, IDisposable
             return;
         }
 
-        DrawRenderFallback(context, destinationRect);
+        if (!string.IsNullOrWhiteSpace(_renderDiagnosticsMessage))
+        {
+            DrawRenderFallback(context, destinationRect);
+        }
     }
 
     protected override IPlatformHandle CreateNativeControlCore(IPlatformHandle parent)
     {
+        if (_instance.IsDisposed)
+        {
+            return base.CreateNativeControlCore(parent);
+        }
+
+        _instance.ActivePresenterId = _presenterId;
+
         if (_controller.Platform == NativeWebViewPlatform.MacOS && OperatingSystem.IsMacOS())
         {
-            _macOSHost?.Dispose();
-            _macOSHost = new MacOSNativeWebViewHost(parent, _instanceConfiguration);
+            if (_macOSHost is not null)
+            {
+                _macOSHost.AttachToParent(parent);
+                ApplyRenderModeToNativeHost();
+                return _macOSHost.PlatformHandle;
+            }
+
+            _macOSHost = new MacOSNativeWebViewHost(parent, _instance.InstanceConfiguration);
+            _instance.MacOSHost = _macOSHost;
 
             _macOSHost.SetUserAgent(_controller.UserAgentString);
 
@@ -666,7 +694,7 @@ public class NativeWebView : NativeControlHost, IDisposable
             if (managedControlHandle is not IPlatformHandle platformHandle)
             {
                 throw new InvalidOperationException(
-                    $"Browser managed control handle provider returned '{managedControlHandle?.GetType().FullName ?? "<null>"}' instead of an Avalonia platform handle.");
+                    $"Browser managed control handle provider returned '{managedControlHandle.GetType().FullName ?? "<null>"}' instead of an Avalonia platform handle.");
             }
 
             return platformHandle;
@@ -684,10 +712,25 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     protected override void DestroyNativeControlCore(IPlatformHandle control)
     {
+        if (_instance.IsDisposed)
+        {
+            return;
+        }
+
+        if (_instance.ActivePresenterId != _presenterId)
+        {
+            return;
+        }
+
         if (_macOSHost is not null)
         {
-            _macOSHost.Dispose();
-            _macOSHost = null;
+            _macOSHost.DetachFromParent(preserveRuntime: true);
+
+            if (_instance.ActivePresenterId == _presenterId)
+            {
+                _instance.ActivePresenterId = 0;
+            }
+
             return;
         }
 
@@ -696,16 +739,30 @@ public class NativeWebView : NativeControlHost, IDisposable
         {
             managedControlHandleProvider.ReleaseManagedControlHandle(control);
             base.DestroyNativeControlCore(control);
+            if (_instance.ActivePresenterId == _presenterId)
+            {
+                _instance.ActivePresenterId = 0;
+            }
+
             return;
         }
 
         if (TryGetNativeControlAttachment(out var nativeControlAttachment, out _))
         {
-            nativeControlAttachment.DetachFromNativeParent();
+            nativeControlAttachment.DetachFromNativeParent(preserveRuntime: true);
+            if (_instance.ActivePresenterId == _presenterId)
+            {
+                _instance.ActivePresenterId = 0;
+            }
+
             return;
         }
 
         base.DestroyNativeControlCore(control);
+        if (_instance.ActivePresenterId == _presenterId)
+        {
+            _instance.ActivePresenterId = 0;
+        }
     }
 
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
@@ -759,17 +816,20 @@ public class NativeWebView : NativeControlHost, IDisposable
 
         _controller.CoreWebView2EnvironmentRequested -= OnCoreWebView2EnvironmentRequestedInternal;
         _controller.CoreWebView2ControllerOptionsRequested -= OnCoreWebView2ControllerOptionsRequestedInternal;
-        _macOSHost?.Dispose();
-        _macOSHost = null;
 
-        _controller.Dispose();
+        if (_ownsInstance)
+        {
+            _instance.Dispose();
+        }
+
+        _macOSHost = null;
     }
 
     private void ApplyInstanceConfigurationToBackend()
     {
         if (_controller.TryGetBackend<INativeWebViewInstanceConfigurationTarget>(out var target))
         {
-            target.ApplyInstanceConfiguration(_instanceConfiguration.Clone());
+            target.ApplyInstanceConfiguration(_instance.InstanceConfiguration.Clone());
         }
     }
 
@@ -821,12 +881,12 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     private void OnCoreWebView2EnvironmentRequestedInternal(object? sender, CoreWebViewEnvironmentRequestedEventArgs e)
     {
-        _instanceConfiguration.ApplyEnvironmentOptions(e.Options);
+        _instance.InstanceConfiguration.ApplyEnvironmentOptions(e.Options);
     }
 
     private void OnCoreWebView2ControllerOptionsRequestedInternal(object? sender, CoreWebViewControllerOptionsRequestedEventArgs e)
     {
-        _instanceConfiguration.ApplyControllerOptions(e.Options);
+        _instance.InstanceConfiguration.ApplyControllerOptions(e.Options);
     }
 
     private void ApplyRenderModeState(bool forceRefresh)
@@ -935,9 +995,14 @@ public class NativeWebView : NativeControlHost, IDisposable
             }
 
             _isUsingSyntheticFrameSource = frame.IsSynthetic;
-            _renderDiagnosticsMessage = frame.IsSynthetic
-                ? $"Using fallback synthetic frame source ({Platform})."
-                : null;
+            _renderDiagnosticsMessage = null;
+
+            if (frame.IsSynthetic)
+            {
+                _renderStatisticsTracker.MarkCaptureSuccess(frame);
+                RaiseRenderFrameCaptured(frame);
+                return frame;
+            }
 
             if (RenderMode == NativeWebViewRenderMode.GpuSurface)
             {
@@ -1096,15 +1161,16 @@ public class NativeWebView : NativeControlHost, IDisposable
                     this,
                     new NativeWebViewRenderFrameCapturedEventArgs(frame));
             }
-            catch (Exception ex)
+            catch
             {
-                Debug.WriteLine($"[NativeWebView] RenderFrameCaptured handler failed: {ex}");
+                // ignored
             }
         }
     }
 
     private void DrawRenderFallback(DrawingContext context, Rect destinationRect)
     {
+        context.FillRectangle(RenderBackgroundBrush, destinationRect);
         context.DrawRectangle(null, new Pen(RenderOutlineBrush, 1), destinationRect.Deflate(0.5));
 
         var status = _renderDiagnosticsMessage ??
@@ -1193,13 +1259,6 @@ public class NativeWebView : NativeControlHost, IDisposable
         }
 
         _macOSHost.SetCaptureSize(request.PixelWidth, request.PixelHeight);
-    }
-
-    private static INativeWebViewBackend CreateDefaultBackend()
-    {
-        NativeWebViewRuntime.EnsureCurrentPlatformRegistered();
-        NativeWebViewRuntime.Factory.TryCreateNativeWebViewBackend(NativeWebViewRuntime.CurrentPlatform, out var backend);
-        return backend;
     }
 
     private Vector ResolveFrameDpi(int pixelWidth, int pixelHeight)
