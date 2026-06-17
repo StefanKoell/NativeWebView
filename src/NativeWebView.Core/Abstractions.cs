@@ -88,6 +88,40 @@ public enum NativeWindowResizeEdge
     BottomRight
 }
 
+public enum NativeWebViewMouseInputKind
+{
+    Move = 0,
+    LeftButtonDown,
+    LeftButtonUp,
+    RightButtonDown,
+    RightButtonUp,
+    MiddleButtonDown,
+    MiddleButtonUp,
+    Wheel,
+    HorizontalWheel,
+    Leave
+}
+
+[Flags]
+public enum NativeWebViewMouseInputModifiers
+{
+    None = 0,
+    LeftButton = 1 << 0,
+    RightButton = 1 << 1,
+    Shift = 1 << 2,
+    Control = 1 << 3,
+    MiddleButton = 1 << 4,
+    XButton1 = 1 << 5,
+    XButton2 = 1 << 6
+}
+
+public readonly record struct NativeWebViewMouseInput(
+    NativeWebViewMouseInputKind Kind,
+    NativeWebViewMouseInputModifiers Modifiers,
+    int X,
+    int Y,
+    int MouseData);
+
 public enum NativeWebViewPrintStatus
 {
     Success = 0,
@@ -606,6 +640,94 @@ public interface INativeWebViewFrameSource
         NativeWebViewRenderMode renderMode,
         NativeWebViewRenderFrameRequest request,
         CancellationToken cancellationToken = default);
+}
+
+public interface INativeWebViewGpuFrameSource
+{
+    bool SupportsGpuFrame(NativeWebViewRenderMode renderMode);
+
+    NativeWebViewGpuFrame? TryGetLatestGpuFrame(NativeWebViewRenderMode renderMode);
+
+    void SetGpuFrameCaptureEnabled(bool enabled);
+
+    void SetGpuFrameOnlyRenderingEnabled(bool enabled);
+}
+
+public enum NativeWebViewGpuFrameBackend
+{
+    Unknown,
+    D3D11Texture2D,
+}
+
+public sealed class NativeWebViewGpuFrame
+{
+    public NativeWebViewGpuFrame(
+        int pixelWidth,
+        int pixelHeight,
+        NativeWebViewGpuFrameBackend backend,
+        object nativeResource,
+        long frameId,
+        DateTimeOffset capturedAtUtc,
+        NativeWebViewRenderMode renderMode,
+        nint sharedHandle = 0,
+        string? sharedHandleType = null,
+        bool requiresKeyedMutex = false,
+        uint keyedMutexAcquireKey = 0,
+        uint keyedMutexReleaseKey = 0)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pixelWidth);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(pixelHeight);
+        ArgumentNullException.ThrowIfNull(nativeResource);
+
+        PixelWidth = pixelWidth;
+        PixelHeight = pixelHeight;
+        Backend = backend;
+        NativeResource = nativeResource;
+        FrameId = frameId;
+        CapturedAtUtc = capturedAtUtc;
+        RenderMode = renderMode;
+        SharedHandle = sharedHandle;
+        SharedHandleType = sharedHandleType;
+        RequiresKeyedMutex = requiresKeyedMutex;
+        KeyedMutexAcquireKey = keyedMutexAcquireKey;
+        KeyedMutexReleaseKey = keyedMutexReleaseKey;
+    }
+
+    public int PixelWidth { get; }
+
+    public int PixelHeight { get; }
+
+    public NativeWebViewGpuFrameBackend Backend { get; }
+
+    public object NativeResource { get; }
+
+    public long FrameId { get; }
+
+    public DateTimeOffset CapturedAtUtc { get; }
+
+    public NativeWebViewRenderMode RenderMode { get; }
+
+    public nint SharedHandle { get; }
+
+    public string? SharedHandleType { get; }
+
+    public bool RequiresKeyedMutex { get; }
+
+    public uint KeyedMutexAcquireKey { get; }
+
+    public uint KeyedMutexReleaseKey { get; }
+}
+
+public interface INativeWebViewRenderModeTarget
+{
+    void SetRenderMode(NativeWebViewRenderMode renderMode);
+}
+
+public interface INativeWebViewCompositionInputSink
+{
+    void FocusCompositionInput();
+
+    bool SendMouseInput(NativeWebViewMouseInput input);
 }
 
 public interface INativeWebViewBackend : IDisposable

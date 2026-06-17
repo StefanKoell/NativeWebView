@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
@@ -8,14 +9,18 @@ using NativeWebView.Interop;
 
 namespace NativeWebView.Platform.Windows;
 
-public sealed class WindowsNativeWebViewBackend
+public sealed partial class WindowsNativeWebViewBackend
     : INativeWebViewBackend,
       INativeWebViewFrameSource,
+      INativeWebViewGpuFrameSource,
+      INativeWebViewRenderModeTarget,
       INativeWebViewPlatformHandleProvider,
       INativeWebViewInstanceConfigurationTarget,
+      INativeWebViewCompositionInputSink,
       INativeWebViewNativeControlAttachment
 {
     private const int EInvalidArgHResult = unchecked((int)0x80070057);
+    private const int ErrorInvalidStateHResult = unchecked((int)0x8007139F);
     private static readonly TimeSpan TransientReparentNavigationSuppressionWindow = TimeSpan.FromMilliseconds(750);
     internal const string ControllerOptionsFallbackOriginalExceptionDataKey =
         "NativeWebView.Windows.ControllerOptionsFallbackOriginalException";
@@ -43,6 +48,7 @@ public sealed class WindowsNativeWebViewBackend
 
     private CoreWebView2Environment? _environment;
     private CoreWebView2Controller? _controller;
+    private CoreWebView2CompositionController? _compositionController;
     private CoreWebView2? _coreWebView;
     private NativeWebViewEnvironmentOptions? _preparedEnvironmentOptions;
     private NativeWebViewControllerOptions? _preparedControllerOptions;
@@ -53,7 +59,7 @@ public sealed class WindowsNativeWebViewBackend
     private GCHandle _selfHandle;
     private nint _parentWindowHandle;
     private nint _childWindowHandle;
-    private nint _parkingWindowHandle;
+    private nint _nativeHostPlaceholderHandle;
     private nint _viewComHandle;
     private nint _controllerComHandle;
     private int _lastAttachedWidth = 1;
@@ -61,6 +67,7 @@ public sealed class WindowsNativeWebViewBackend
 
     private int _historyIndex = -1;
     private long _frameSequence;
+    private NativeWebViewRenderMode _renderMode = NativeWebViewRenderMode.Embedded;
 
     private bool _isStubInitialized;
     private bool _isRuntimeInitialized;
@@ -78,6 +85,8 @@ public sealed class WindowsNativeWebViewBackend
     private double _zoomFactor;
     private DateTimeOffset _suppressSameUrlNavigationUntilUtc;
     private bool _suppressNextSameUrlNavigationCompletion;
+    private int _compositionNavigationRetryVersion;
+    private WinCompositionCaptureHost? _winCompositionCaptureHost;
     private string? _headerString;
     private string? _userAgentString;
 
@@ -278,7 +287,14 @@ public sealed class WindowsNativeWebViewBackend
         {
             if (_coreWebView is not null)
             {
-                _coreWebView.Reload();
+                try
+                {
+                    _coreWebView.Reload();
+                }
+                catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+                {
+                    RecoverInvalidRuntimeState(_currentUrl);
+                }
             }
             else if (_currentUrl is not null)
             {
@@ -305,7 +321,14 @@ public sealed class WindowsNativeWebViewBackend
 
         if (_coreWebView is not null)
         {
-            _coreWebView.Stop();
+            try
+            {
+                _coreWebView.Stop();
+            }
+            catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+            {
+                RecoverInvalidRuntimeState(_currentUrl);
+            }
         }
     }
 
@@ -316,9 +339,16 @@ public sealed class WindowsNativeWebViewBackend
 
         if (ShouldUseRuntimePath())
         {
-            if (_coreWebView is not null && _coreWebView.CanGoBack)
+            try
             {
-                _coreWebView.GoBack();
+                if (_coreWebView is not null && _coreWebView.CanGoBack)
+                {
+                    _coreWebView.GoBack();
+                }
+            }
+            catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+            {
+                RecoverInvalidRuntimeState(_currentUrl);
             }
 
             return;
@@ -342,9 +372,16 @@ public sealed class WindowsNativeWebViewBackend
 
         if (ShouldUseRuntimePath())
         {
-            if (_coreWebView is not null && _coreWebView.CanGoForward)
+            try
             {
-                _coreWebView.GoForward();
+                if (_coreWebView is not null && _coreWebView.CanGoForward)
+                {
+                    _coreWebView.GoForward();
+                }
+            }
+            catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+            {
+                RecoverInvalidRuntimeState(_currentUrl);
             }
 
             return;
@@ -581,6 +618,63 @@ public sealed class WindowsNativeWebViewBackend
         });
     }
 
+    public void FocusCompositionInput()
+    {
+        EnsureNotDisposed();
+
+        if (_compositionController is null || _childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _ = Win32.SetFocus(_childWindowHandle);
+        _controller?.MoveFocus(CoreWebView2MoveFocusReason.Programmatic);
+    }
+
+    public bool SendMouseInput(NativeWebViewMouseInput input)
+    {
+        EnsureNotDisposed();
+
+        if (_compositionController is null)
+        {
+            return false;
+        }
+
+        var eventKind = input.Kind switch
+        {
+            NativeWebViewMouseInputKind.Move => CoreWebView2MouseEventKind.Move,
+            NativeWebViewMouseInputKind.LeftButtonDown => CoreWebView2MouseEventKind.LeftButtonDown,
+            NativeWebViewMouseInputKind.LeftButtonUp => CoreWebView2MouseEventKind.LeftButtonUp,
+            NativeWebViewMouseInputKind.RightButtonDown => CoreWebView2MouseEventKind.RightButtonDown,
+            NativeWebViewMouseInputKind.RightButtonUp => CoreWebView2MouseEventKind.RightButtonUp,
+            NativeWebViewMouseInputKind.MiddleButtonDown => CoreWebView2MouseEventKind.MiddleButtonDown,
+            NativeWebViewMouseInputKind.MiddleButtonUp => CoreWebView2MouseEventKind.MiddleButtonUp,
+            NativeWebViewMouseInputKind.Wheel => CoreWebView2MouseEventKind.Wheel,
+            NativeWebViewMouseInputKind.HorizontalWheel => CoreWebView2MouseEventKind.HorizontalWheel,
+            NativeWebViewMouseInputKind.Leave => CoreWebView2MouseEventKind.Leave,
+            _ => (CoreWebView2MouseEventKind)(-1),
+        };
+
+        if ((int)eventKind == -1)
+        {
+            return false;
+        }
+
+        try
+        {
+            _compositionController.SendMouseInput(
+                eventKind,
+                ToWebView2MouseModifiers(input.Modifiers),
+                unchecked((uint)input.MouseData),
+                new Point(input.X, input.Y));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public bool SupportsRenderMode(NativeWebViewRenderMode renderMode)
     {
         return renderMode switch
@@ -592,7 +686,7 @@ public sealed class WindowsNativeWebViewBackend
         };
     }
 
-    public Task<NativeWebViewRenderFrame?> CaptureFrameAsync(
+    public async Task<NativeWebViewRenderFrame?> CaptureFrameAsync(
         NativeWebViewRenderMode renderMode,
         NativeWebViewRenderFrameRequest request,
         CancellationToken cancellationToken = default)
@@ -603,17 +697,106 @@ public sealed class WindowsNativeWebViewBackend
 
         if (renderMode == NativeWebViewRenderMode.Embedded || !SupportsRenderMode(renderMode))
         {
-            return Task.FromResult<NativeWebViewRenderFrame?>(null);
+            return null;
         }
 
-        return Task.FromResult<NativeWebViewRenderFrame?>(
+        if (ShouldUseRuntimePath())
+        {
+            try
+            {
+                await EnsureRuntimeInitializedAsync(cancellationToken).ConfigureAwait(true);
+                UpdateCompositedCaptureSize(request);
+                var captured = await CapturePreviewFrameAsync(renderMode, request, cancellationToken).ConfigureAwait(false);
+                if (captured is not null)
+                {
+                    return captured;
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                // Fall back to a deterministic diagnostic frame if WebView2 capture is temporarily unavailable.
+            }
+        }
+
+        return
             NativeWebViewBackendSupport.CreateSyntheticRenderFrame(
                 Platform,
                 _currentUrl,
                 ref _frameSequence,
-                renderMode,
-                request.PixelWidth,
-                request.PixelHeight));
+            renderMode,
+            request.PixelWidth,
+            request.PixelHeight);
+    }
+
+    public bool SupportsGpuFrame(NativeWebViewRenderMode renderMode)
+    {
+        return renderMode != NativeWebViewRenderMode.Embedded &&
+               SupportsRenderMode(renderMode);
+    }
+
+    public NativeWebViewGpuFrame? TryGetLatestGpuFrame(NativeWebViewRenderMode renderMode)
+    {
+        EnsureNotDisposed();
+
+        if (!SupportsGpuFrame(renderMode))
+        {
+            return null;
+        }
+
+        _winCompositionCaptureHost?.SetGpuFrameCaptureEnabled(true);
+        return _winCompositionCaptureHost?.TryGetLatestGpuFrame(renderMode);
+    }
+
+    public void SetGpuFrameCaptureEnabled(bool enabled)
+    {
+        _winCompositionCaptureHost?.SetGpuFrameCaptureEnabled(enabled);
+    }
+
+    public void SetGpuFrameOnlyRenderingEnabled(bool enabled)
+    {
+        _winCompositionCaptureHost?.SetGpuFrameOnlyRenderingEnabled(enabled);
+    }
+
+    private void UpdateCompositedCaptureSize(NativeWebViewRenderFrameRequest request)
+    {
+        if (_compositionController is null)
+        {
+            return;
+        }
+
+        NotifyParentWindowPositionChanged();
+        _lastAttachedWidth = Math.Max(1, request.PixelWidth);
+        _lastAttachedHeight = Math.Max(1, request.PixelHeight);
+        HideNativeHostPlaceholder();
+        ResizeChildWindowForCompositedRendering();
+        UpdateControllerBounds();
+    }
+
+    public void SetRenderMode(NativeWebViewRenderMode renderMode)
+    {
+        EnsureNotDisposed();
+
+        if (_renderMode == renderMode)
+        {
+            return;
+        }
+
+        _renderMode = renderMode;
+
+        if (_coreWebView is not null && IsCompositionMode(renderMode) != (_compositionController is not null))
+        {
+            SyncNavigationSnapshotFromRuntime();
+            DestroyRuntimeController();
+            _pendingNavigationUri = _currentUrl;
+            _ = TryInitializeRuntimeInBackgroundAsync();
+            return;
+        }
+
+        ApplyRenderModeVisibility();
     }
 
     public bool TryGetPlatformHandle(out NativePlatformHandle handle)
@@ -660,8 +843,17 @@ public sealed class WindowsNativeWebViewBackend
                 $"Windows native control attachment requires an HWND parent, but received '{parentHandle.HandleDescriptor}'.");
         }
 
+        var isCompositionMode = IsCompositionMode(_renderMode);
         if (_childWindowHandle != IntPtr.Zero)
         {
+            _parentWindowHandle = parentHandle.Handle;
+            if (isCompositionMode)
+            {
+                var placeholderHandle = EnsureNativeHostPlaceholder(parentHandle.Handle);
+                _attachmentTcs.TrySetResult(true);
+                return new NativePlatformHandle(placeholderHandle, "HWND");
+            }
+
             if (_parentWindowHandle == parentHandle.Handle)
             {
                 ShowPreservedChildWindow();
@@ -675,12 +867,14 @@ public sealed class WindowsNativeWebViewBackend
         EnsureChildWindowClassRegistered();
 
         var instanceHandle = Win32.GetModuleHandle(null);
+        _parentWindowHandle = parentHandle.Handle;
+
         var childHandle = Win32.CreateWindowEx(
             0,
             Win32.ChildWindowClassName,
             string.Empty,
             Win32.WindowStyles.WS_CHILD |
-            Win32.WindowStyles.WS_VISIBLE |
+            (isCompositionMode ? 0 : Win32.WindowStyles.WS_VISIBLE) |
             Win32.WindowStyles.WS_CLIPSIBLINGS |
             Win32.WindowStyles.WS_CLIPCHILDREN,
             0,
@@ -698,7 +892,6 @@ public sealed class WindowsNativeWebViewBackend
                 $"Failed to create Windows child host window. Win32 error: {Marshal.GetLastWin32Error()}.");
         }
 
-        _parentWindowHandle = parentHandle.Handle;
         _childWindowHandle = childHandle;
         _attachmentTcs.TrySetResult(true);
 
@@ -710,11 +903,18 @@ public sealed class WindowsNativeWebViewBackend
         _selfHandle = GCHandle.Alloc(this);
         Win32.SetWindowLongPtr(childHandle, Win32.WindowLongIndex.GWLP_USERDATA, GCHandle.ToIntPtr(_selfHandle));
         ResizeChildWindowToParent();
+
         UpdateControllerBounds();
+        ApplyRenderModeVisibility();
 
         if (_runtimeInitializationRequested)
         {
             _ = TryInitializeRuntimeInBackgroundAsync();
+        }
+
+        if (isCompositionMode)
+        {
+            return new NativePlatformHandle(EnsureNativeHostPlaceholder(parentHandle.Handle), "HWND");
         }
 
         return new NativePlatformHandle(childHandle, "HWND");
@@ -765,6 +965,8 @@ public sealed class WindowsNativeWebViewBackend
 
     private void DetachFromNativeParentCore(bool preserveRuntime)
     {
+        DestroyNativeHostPlaceholder();
+
         if (preserveRuntime && _childWindowHandle != IntPtr.Zero)
         {
             HidePreservedChildWindow();
@@ -786,7 +988,7 @@ public sealed class WindowsNativeWebViewBackend
             }
         }
 
-        DestroyParkingWindow();
+        DestroyCompositionHost();
 
         if (_selfHandle.IsAllocated)
         {
@@ -794,6 +996,7 @@ public sealed class WindowsNativeWebViewBackend
         }
 
         _childWindowHandle = IntPtr.Zero;
+        _nativeHostPlaceholderHandle = IntPtr.Zero;
         _parentWindowHandle = IntPtr.Zero;
         _attachmentTcs = CreatePendingAttachmentSource();
     }
@@ -813,30 +1016,14 @@ public sealed class WindowsNativeWebViewBackend
         ShowPreservedChildWindow();
         ResizeChildWindowToParent();
         UpdateControllerBounds();
+        ApplyRenderModeVisibility();
     }
 
     private void HidePreservedChildWindow()
     {
         SyncNavigationSnapshotFromRuntime();
 
-        // Keep the child HWND parented while detached so WebView2 does not rebuild the page.
-        var parkingWindowHandle = EnsureParkingWindow();
-        if (parkingWindowHandle == IntPtr.Zero)
-        {
-            _ = Win32.ShowWindow(_childWindowHandle, Win32.ShowWindowCommand.Hide);
-            return;
-        }
-
-        ResizeParkingWindow();
-        _ = Win32.SetParent(_childWindowHandle, parkingWindowHandle);
-        _ = Win32.SetWindowPos(
-            _childWindowHandle,
-            IntPtr.Zero,
-            0,
-            0,
-            _lastAttachedWidth,
-            _lastAttachedHeight,
-            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+        _ = Win32.ShowWindow(_childWindowHandle, Win32.ShowWindowCommand.Hide);
     }
 
     private void ShowPreservedChildWindow()
@@ -847,65 +1034,114 @@ public sealed class WindowsNativeWebViewBackend
         UpdateControllerBounds();
     }
 
-    private nint EnsureParkingWindow()
+    private nint EnsureNativeHostPlaceholder(nint parentWindowHandle)
     {
-        if (_parkingWindowHandle != IntPtr.Zero && Win32.IsWindow(_parkingWindowHandle))
+        if (_nativeHostPlaceholderHandle != IntPtr.Zero &&
+            Win32.IsWindow(_nativeHostPlaceholderHandle))
         {
-            return _parkingWindowHandle;
+            if (Win32.GetParent(_nativeHostPlaceholderHandle) != parentWindowHandle)
+            {
+                _ = Win32.SetParent(_nativeHostPlaceholderHandle, parentWindowHandle);
+            }
+
+            HideNativeHostPlaceholder();
+            return _nativeHostPlaceholderHandle;
         }
 
         EnsureChildWindowClassRegistered();
 
         var instanceHandle = Win32.GetModuleHandle(null);
-        _parkingWindowHandle = Win32.CreateWindowEx(
+        _nativeHostPlaceholderHandle = Win32.CreateWindowEx(
             0,
             Win32.ChildWindowClassName,
             string.Empty,
-            Win32.WindowStyles.WS_POPUP |
+            Win32.WindowStyles.WS_CHILD |
             Win32.WindowStyles.WS_CLIPSIBLINGS |
             Win32.WindowStyles.WS_CLIPCHILDREN,
             -32000,
             -32000,
-            _lastAttachedWidth,
-            _lastAttachedHeight,
-            IntPtr.Zero,
+            1,
+            1,
+            parentWindowHandle,
             IntPtr.Zero,
             instanceHandle,
             IntPtr.Zero);
 
-        return _parkingWindowHandle;
+        if (_nativeHostPlaceholderHandle == IntPtr.Zero)
+        {
+            throw new InvalidOperationException(
+                $"Failed to create Windows native host placeholder. Win32 error: {Marshal.GetLastWin32Error()}.");
+        }
+
+        HideNativeHostPlaceholder();
+        return _nativeHostPlaceholderHandle;
     }
 
-    private void ResizeParkingWindow()
+    private void HideNativeHostPlaceholder()
     {
-        if (_parkingWindowHandle == IntPtr.Zero || !Win32.IsWindow(_parkingWindowHandle))
+        if (_nativeHostPlaceholderHandle == IntPtr.Zero ||
+            !Win32.IsWindow(_nativeHostPlaceholderHandle))
         {
+            HideNativeHostWrapperForCompositedRendering();
             return;
         }
 
+        _ = Win32.ShowWindow(_nativeHostPlaceholderHandle, Win32.ShowWindowCommand.Hide);
         _ = Win32.SetWindowPos(
-            _parkingWindowHandle,
+            _nativeHostPlaceholderHandle,
             IntPtr.Zero,
             -32000,
             -32000,
-            _lastAttachedWidth,
-            _lastAttachedHeight,
+            1,
+            1,
             Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+        HideNativeHostWrapperForCompositedRendering();
     }
 
-    private void DestroyParkingWindow()
+    private void HideNativeHostWrapperForCompositedRendering()
     {
-        if (_parkingWindowHandle == IntPtr.Zero)
+        if (!IsCompositionMode(_renderMode) ||
+            _parentWindowHandle == IntPtr.Zero ||
+            !Win32.IsWindow(_parentWindowHandle))
         {
             return;
         }
 
-        if (Win32.IsWindow(_parkingWindowHandle))
+        _ = Win32.ShowWindow(_parentWindowHandle, Win32.ShowWindowCommand.Hide);
+        _ = Win32.SetWindowPos(
+            _parentWindowHandle,
+            IntPtr.Zero,
+            -32000,
+            -32000,
+            1,
+            1,
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+    }
+
+    private void ShowNativeHostWrapperForEmbeddedRendering()
+    {
+        if (_parentWindowHandle == IntPtr.Zero ||
+            !Win32.IsWindow(_parentWindowHandle))
         {
-            Win32.DestroyWindow(_parkingWindowHandle);
+            return;
         }
 
-        _parkingWindowHandle = IntPtr.Zero;
+        _ = Win32.ShowWindow(_parentWindowHandle, Win32.ShowWindowCommand.Show);
+    }
+
+    private void DestroyNativeHostPlaceholder()
+    {
+        if (_nativeHostPlaceholderHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (Win32.IsWindow(_nativeHostPlaceholderHandle))
+        {
+            Win32.DestroyWindow(_nativeHostPlaceholderHandle);
+        }
+
+        _nativeHostPlaceholderHandle = IntPtr.Zero;
     }
 
     private void ResizeChildWindowToParent()
@@ -932,6 +1168,23 @@ public sealed class WindowsNativeWebViewBackend
             width,
             height,
             Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate | Win32.SetWindowPosFlags.ShowWindow);
+    }
+
+    private void ResizeChildWindowForCompositedRendering()
+    {
+        if (_childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _ = Win32.SetWindowPos(
+            _childWindowHandle,
+            IntPtr.Zero,
+            0,
+            0,
+            Math.Max(1, _lastAttachedWidth),
+            Math.Max(1, _lastAttachedHeight),
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
     }
 
     private static TaskCompletionSource<bool> CreatePendingAttachmentSource()
@@ -992,7 +1245,7 @@ public sealed class WindowsNativeWebViewBackend
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (_coreWebView is not null && _controller is not null)
+        if (_isRuntimeInitialized && _coreWebView is not null && _controller is not null)
         {
             return;
         }
@@ -1000,7 +1253,7 @@ public sealed class WindowsNativeWebViewBackend
         await _runtimeGate.WaitAsync(cancellationToken).ConfigureAwait(true);
         try
         {
-            if (_coreWebView is not null && _controller is not null)
+            if (_isRuntimeInitialized && _coreWebView is not null && _controller is not null)
             {
                 return;
             }
@@ -1019,17 +1272,25 @@ public sealed class WindowsNativeWebViewBackend
                 throw new InvalidOperationException("Cannot initialize WebView2 without an attached child HWND.");
             }
 
+            var controllerParentWindowHandle =
+                IsCompositionMode(_renderMode) && _parentWindowHandle != IntPtr.Zero
+                    ? _parentWindowHandle
+                    : _childWindowHandle;
             _controller = await CreateRuntimeControllerAsync(
                 _environment,
-                _childWindowHandle,
+                controllerParentWindowHandle,
                 _preparedControllerOptions,
+                _renderMode,
                 cancellationToken).ConfigureAwait(true);
+            _compositionController = _controller as CoreWebView2CompositionController;
 
             _coreWebView = _controller.CoreWebView2;
             CaptureRuntimeHandles();
             AttachRuntimeEvents();
             ApplyRuntimeSettings();
             UpdateControllerBounds();
+            EnsureCompositionRoot();
+            ApplyRenderModeVisibility();
             var requestedPendingNavigationUri = _pendingNavigationUri;
             SyncNavigationSnapshotFromRuntime();
             _pendingNavigationUri = ResolveInitializationNavigationTarget(requestedPendingNavigationUri, _currentUrl);
@@ -1192,11 +1453,77 @@ public sealed class WindowsNativeWebViewBackend
                 "GET",
                 null,
                 _headerString);
-            _coreWebView.NavigateWithWebResourceRequest(request);
+            try
+            {
+                _coreWebView.NavigateWithWebResourceRequest(request);
+            }
+            catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+            {
+                RecoverInvalidRuntimeState(uri);
+            }
+
             return;
         }
 
-        _coreWebView.Navigate(navigationTarget);
+        try
+        {
+            _coreWebView.Navigate(navigationTarget);
+            ScheduleCompositionNavigationRetry(uri, navigationTarget);
+        }
+        catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+        {
+            RecoverInvalidRuntimeState(uri);
+        }
+    }
+
+    private async void ScheduleCompositionNavigationRetry(Uri uri, string navigationTarget)
+    {
+        if (_compositionController is null)
+        {
+            return;
+        }
+
+        var version = Interlocked.Increment(ref _compositionNavigationRetryVersion);
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(true);
+
+            if (_disposed ||
+                version != _compositionNavigationRetryVersion ||
+                _compositionController is null ||
+                _coreWebView is null)
+            {
+                return;
+            }
+
+            if (!TryGetRuntimeSource(out var source))
+            {
+                RecoverInvalidRuntimeState(uri);
+                return;
+            }
+
+            if (!IsBlankRuntimeSource(source))
+            {
+                return;
+            }
+
+            try
+            {
+                _coreWebView.Navigate(navigationTarget);
+            }
+            catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+            {
+                RecoverInvalidRuntimeState(uri);
+                return;
+            }
+        }
+    }
+
+    private static bool IsBlankRuntimeSource(string? source)
+    {
+        return string.IsNullOrWhiteSpace(source) ||
+            string.Equals(source, "about:blank", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ApplyRuntimeSettings()
@@ -1248,14 +1575,21 @@ public sealed class WindowsNativeWebViewBackend
     {
         if (_coreWebView is not null)
         {
-            _coreWebView.NavigationStarting -= OnNavigationStarting;
-            _coreWebView.NavigationCompleted -= OnNavigationCompleted;
-            _coreWebView.WebMessageReceived -= OnWebMessageReceived;
-            _coreWebView.HistoryChanged -= OnHistoryChanged;
-            _coreWebView.NewWindowRequested -= OnNewWindowRequested;
-            _coreWebView.ContextMenuRequested -= OnContextMenuRequested;
-            _coreWebView.WindowCloseRequested -= OnWindowCloseRequested;
-            _coreWebView.WebResourceRequested -= OnWebResourceRequested;
+            try
+            {
+                _coreWebView.NavigationStarting -= OnNavigationStarting;
+                _coreWebView.NavigationCompleted -= OnNavigationCompleted;
+                _coreWebView.WebMessageReceived -= OnWebMessageReceived;
+                _coreWebView.HistoryChanged -= OnHistoryChanged;
+                _coreWebView.NewWindowRequested -= OnNewWindowRequested;
+                _coreWebView.ContextMenuRequested -= OnContextMenuRequested;
+                _coreWebView.WindowCloseRequested -= OnWindowCloseRequested;
+                _coreWebView.WebResourceRequested -= OnWebResourceRequested;
+            }
+            catch
+            {
+                // Ignore teardown failures from a WebView2 instance that is already invalid.
+            }
 
             try
             {
@@ -1269,7 +1603,14 @@ public sealed class WindowsNativeWebViewBackend
 
         if (_controller is not null)
         {
-            _controller.ZoomFactorChanged -= OnZoomFactorChanged;
+            try
+            {
+                _controller.ZoomFactorChanged -= OnZoomFactorChanged;
+            }
+            catch
+            {
+                // Ignore teardown failures from a controller that is already invalid.
+            }
         }
     }
 
@@ -1283,6 +1624,7 @@ public sealed class WindowsNativeWebViewBackend
         DetachRuntimeEvents();
         ReleaseComHandle(ref _viewComHandle);
         ReleaseComHandle(ref _controllerComHandle);
+        DestroyCompositionHost();
 
         if (_controller is not null)
         {
@@ -1297,6 +1639,7 @@ public sealed class WindowsNativeWebViewBackend
         }
 
         _controller = null;
+        _compositionController = null;
         _coreWebView = null;
         _isRuntimeInitialized = false;
         UpdateHistorySnapshot(canGoBack: false, canGoForward: false);
@@ -1326,6 +1669,17 @@ public sealed class WindowsNativeWebViewBackend
             return;
         }
 
+        NotifyParentWindowPositionChanged();
+        if (_compositionController is not null)
+        {
+            _controller.Bounds = new Rectangle(
+                0,
+                0,
+                Math.Max(1, _lastAttachedWidth),
+                Math.Max(1, _lastAttachedHeight));
+            return;
+        }
+
         if (!Win32.GetClientRect(_childWindowHandle, out var rect))
         {
             return;
@@ -1336,6 +1690,181 @@ public sealed class WindowsNativeWebViewBackend
         _controller.Bounds = new Rectangle(0, 0, width, height);
     }
 
+    private void NotifyParentWindowPositionChanged()
+    {
+        if (_controller is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _controller.NotifyParentWindowPositionChanged();
+        }
+        catch
+        {
+            // Best-effort synchronization for composition-hosted WebView2.
+        }
+    }
+
+    private void EnsureCompositionRoot()
+    {
+        if (_compositionController is null || _childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        _winCompositionCaptureHost ??= new WinCompositionCaptureHost();
+        _compositionController.RootVisualTarget = _winCompositionCaptureHost.WebViewVisual;
+        UpdateControllerBounds();
+    }
+
+    private void ApplyRenderModeVisibility()
+    {
+        if (_childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var isEmbedded = _renderMode == NativeWebViewRenderMode.Embedded;
+        if (isEmbedded)
+        {
+            RestoreEmbeddedChildWindow();
+        }
+        else if (_compositionController is not null)
+        {
+            HideNativeHostPlaceholder();
+        }
+        else
+        {
+            HideNativeHostPlaceholder();
+        }
+
+        if (_controller is not null)
+        {
+            try
+            {
+                _controller.IsVisible = true;
+            }
+            catch
+            {
+                // Visibility is best-effort; the HWND z-order is what affects Avalonia overlays.
+            }
+        }
+
+        if (isEmbedded)
+        {
+            ResizeChildWindowToParent();
+            UpdateControllerBounds();
+        }
+        else if (_compositionController is not null)
+        {
+            ResizeChildWindowForCompositedRendering();
+            UpdateControllerBounds();
+            EnsureCompositionRoot();
+        }
+    }
+
+    private void RestoreEmbeddedChildWindow()
+    {
+        if (_childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (_parentWindowHandle != IntPtr.Zero &&
+            Win32.GetParent(_childWindowHandle) != _parentWindowHandle)
+        {
+            ShowNativeHostWrapperForEmbeddedRendering();
+            SuppressTransientSameUrlNavigation();
+            _ = Win32.SetParent(_childWindowHandle, _parentWindowHandle);
+        }
+
+        ShowNativeHostWrapperForEmbeddedRendering();
+        _ = Win32.ShowWindow(_childWindowHandle, Win32.ShowWindowCommand.Show);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private async Task<NativeWebViewRenderFrame?> CapturePreviewFrameAsync(
+        NativeWebViewRenderMode renderMode,
+        NativeWebViewRenderFrameRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (_coreWebView is null)
+        {
+            return null;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (_compositionController is not null &&
+            _winCompositionCaptureHost is not null &&
+            OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041))
+        {
+            var capturedFrame = await _winCompositionCaptureHost
+                .CaptureFrameAsync(renderMode, request, Interlocked.Increment(ref _frameSequence), cancellationToken)
+                .ConfigureAwait(true);
+            if (capturedFrame is not null)
+            {
+                return capturedFrame;
+            }
+        }
+
+        await using var stream = new MemoryStream();
+        await _coreWebView.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, stream)
+            .ConfigureAwait(true);
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (stream.Length == 0)
+        {
+            return null;
+        }
+
+        stream.Position = 0;
+        var width = Math.Max(1, request.PixelWidth);
+        var height = Math.Max(1, request.PixelHeight);
+        using var source = new Bitmap(stream);
+        using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppPArgb);
+        using (var graphics = Graphics.FromImage(bitmap))
+        {
+            graphics.DrawImage(source, 0, 0, width, height);
+        }
+
+        var rect = new Rectangle(0, 0, width, height);
+        var data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+        try
+        {
+            var bytesPerRow = width * 4;
+            var pixelData = new byte[bytesPerRow * height];
+            var sourceStride = Math.Abs(data.Stride);
+
+            for (var row = 0; row < height; row++)
+            {
+                var sourceRow = data.Stride >= 0
+                    ? IntPtr.Add(data.Scan0, row * data.Stride)
+                    : IntPtr.Add(data.Scan0, (height - 1 - row) * sourceStride);
+                Marshal.Copy(sourceRow, pixelData, row * bytesPerRow, bytesPerRow);
+            }
+
+            return new NativeWebViewRenderFrame(
+                width,
+                height,
+                bytesPerRow,
+                NativeWebViewRenderPixelFormat.Bgra8888Premultiplied,
+                pixelData,
+                isSynthetic: false,
+                frameId: Interlocked.Increment(ref _frameSequence),
+                capturedAtUtc: DateTimeOffset.UtcNow,
+                renderMode: renderMode,
+                origin: NativeWebViewRenderFrameOrigin.NativeCapture);
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
+        }
+    }
+
     private void SyncNavigationSnapshotFromRuntime()
     {
         if (_coreWebView is null)
@@ -1343,9 +1872,16 @@ public sealed class WindowsNativeWebViewBackend
             return;
         }
 
-        _currentUrl = TryCreateUri(_coreWebView.Source) ?? _currentUrl;
-        _pendingNavigationUri = _currentUrl;
-        UpdateHistorySnapshot(_coreWebView.CanGoBack, _coreWebView.CanGoForward);
+        try
+        {
+            _currentUrl = TryCreateUri(_coreWebView.Source) ?? _currentUrl;
+            _pendingNavigationUri = _currentUrl;
+            UpdateHistorySnapshot(_coreWebView.CanGoBack, _coreWebView.CanGoForward);
+        }
+        catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+        {
+            RecoverInvalidRuntimeState(_currentUrl);
+        }
     }
 
     internal static Uri? ResolveInitializationNavigationTarget(Uri? requestedPendingNavigationUri, Uri? runtimeCurrentUri)
@@ -1600,12 +2136,114 @@ public sealed class WindowsNativeWebViewBackend
             exception is COMException { HResult: EInvalidArgHResult };
     }
 
+    private static bool IsInvalidRuntimeStateException(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        return exception is InvalidOperationException { InnerException: COMException { HResult: ErrorInvalidStateHResult } } ||
+            exception is COMException { HResult: ErrorInvalidStateHResult };
+    }
+
+    private bool TryGetRuntimeSource(out string? source)
+    {
+        source = null;
+        if (_coreWebView is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            source = _coreWebView.Source;
+            return true;
+        }
+        catch (Exception ex) when (IsInvalidRuntimeStateException(ex))
+        {
+            return false;
+        }
+    }
+
+    private void RecoverInvalidRuntimeState(Uri? navigationTarget)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _pendingNavigationUri = navigationTarget ?? _currentUrl;
+        _runtimeInitializationRequested = true;
+        DestroyRuntimeController();
+
+        if (ShouldUseRuntimePath())
+        {
+            _ = TryInitializeRuntimeInBackgroundAsync();
+        }
+    }
+
+    private static bool IsCompositionMode(NativeWebViewRenderMode renderMode)
+    {
+        return renderMode is NativeWebViewRenderMode.GpuSurface or NativeWebViewRenderMode.Offscreen;
+    }
+
+    private static CoreWebView2MouseEventVirtualKeys ToWebView2MouseModifiers(NativeWebViewMouseInputModifiers modifiers)
+    {
+        var result = CoreWebView2MouseEventVirtualKeys.None;
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.LeftButton))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.LeftButton;
+        }
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.RightButton))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.RightButton;
+        }
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.Shift))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.Shift;
+        }
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.Control))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.Control;
+        }
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.MiddleButton))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.MiddleButton;
+        }
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.XButton1))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.XButton1;
+        }
+
+        if (modifiers.HasFlag(NativeWebViewMouseInputModifiers.XButton2))
+        {
+            result |= CoreWebView2MouseEventVirtualKeys.XButton2;
+        }
+
+        return result;
+    }
+
     private static async Task<CoreWebView2Controller> CreateRuntimeControllerAsync(
         CoreWebView2Environment environment,
         IntPtr childWindowHandle,
         NativeWebViewControllerOptions? options,
+        NativeWebViewRenderMode renderMode,
         CancellationToken cancellationToken)
     {
+        if (IsCompositionMode(renderMode))
+        {
+            return await CreateRuntimeCompositionControllerAsync(
+                    environment,
+                    childWindowHandle,
+                    options,
+                    cancellationToken)
+                .ConfigureAwait(true);
+        }
+
         if (!RequiresRuntimeControllerOptions(options))
         {
             return await CreateRuntimeControllerWithRetryAsync(
@@ -1639,9 +2277,49 @@ public sealed class WindowsNativeWebViewBackend
         }
     }
 
-    private static async Task<CoreWebView2Controller> CreateRuntimeControllerWithRetryAsync(
-        Func<Task<CoreWebView2Controller>> createAsync,
+    private static async Task<CoreWebView2Controller> CreateRuntimeCompositionControllerAsync(
+        CoreWebView2Environment environment,
+        IntPtr childWindowHandle,
+        NativeWebViewControllerOptions? options,
         CancellationToken cancellationToken)
+    {
+        if (!RequiresRuntimeControllerOptions(options))
+        {
+            return await CreateRuntimeControllerWithRetryAsync(
+                    () => environment.CreateCoreWebView2CompositionControllerAsync(childWindowHandle),
+                    cancellationToken)
+                .ConfigureAwait(true);
+        }
+
+        try
+        {
+            var controllerOptions = CreateRuntimeControllerOptions(environment, options!);
+            return await CreateRuntimeControllerWithRetryAsync(
+                    () => environment.CreateCoreWebView2CompositionControllerAsync(childWindowHandle, controllerOptions),
+                    cancellationToken)
+                .ConfigureAwait(true);
+        }
+        catch (Exception ex) when (ShouldRetryControllerCreationWithoutOptions(options, ex))
+        {
+            try
+            {
+                return await CreateRuntimeControllerWithRetryAsync(
+                        () => environment.CreateCoreWebView2CompositionControllerAsync(childWindowHandle),
+                        cancellationToken)
+                    .ConfigureAwait(true);
+            }
+            catch (Exception retryException)
+            {
+                AttachControllerOptionsFallbackExceptionContext(retryException, ex);
+                throw;
+            }
+        }
+    }
+
+    private static async Task<TController> CreateRuntimeControllerWithRetryAsync<TController>(
+        Func<Task<TController>> createAsync,
+        CancellationToken cancellationToken)
+        where TController : CoreWebView2Controller
     {
         ArgumentNullException.ThrowIfNull(createAsync);
 
@@ -1757,6 +2435,24 @@ public sealed class WindowsNativeWebViewBackend
 
         Marshal.Release(handle);
         handle = IntPtr.Zero;
+    }
+
+    private void DestroyCompositionHost()
+    {
+        try
+        {
+            if (_compositionController is not null)
+            {
+                _compositionController.RootVisualTarget = null!;
+            }
+        }
+        catch
+        {
+            // Best-effort disconnect before releasing the host visual tree.
+        }
+
+        _winCompositionCaptureHost?.Dispose();
+        _winCompositionCaptureHost = null;
     }
 
     private static void EnsureChildWindowClassRegistered()
@@ -1917,6 +2613,9 @@ public sealed class WindowsNativeWebViewBackend
         internal static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
 
         [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -1946,5 +2645,8 @@ public sealed class WindowsNativeWebViewBackend
 
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
         internal static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetFocus(IntPtr hWnd);
     }
 }

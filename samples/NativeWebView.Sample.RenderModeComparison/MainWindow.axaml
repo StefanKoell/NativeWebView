@@ -1,0 +1,60 @@
+<Window
+    x:Class="NativeWebView.Sample.RenderModeComparison.MainWindow"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:nwv="clr-namespace:NativeWebView.Controls;assembly=NativeWebView"
+    Width="360"
+    Height="760"
+    MinWidth="320"
+    MinHeight="640">
+  <Grid RowDefinitions="Auto,*,Auto">
+    <Border Grid.Row="0" Padding="10" Background="#F6F8FA" BorderBrush="#D0D7DE" BorderThickness="0,0,0,1">
+      <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="Auto,*" RowSpacing="8" ColumnSpacing="8">
+        <TextBlock Grid.Row="0" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Text="Mode" />
+        <TextBlock x:Name="ModeTextBlock" Grid.Row="0" Grid.Column="1" VerticalAlignment="Center" />
+        <TextBlock Grid.Row="1" Grid.Column="0" VerticalAlignment="Center" FontWeight="SemiBold" Text="URL" />
+        <TextBox
+            x:Name="UrlTextBox"
+            Grid.Row="1"
+            Grid.Column="1"
+            Height="34"
+            VerticalContentAlignment="Center" />
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="1">
+      <nwv:NativeWebView
+          x:Name="WebView"
+          EnableExperimentalGpuInterop="True"
+          RenderFramesPerSecond="60" />
+
+      <Border
+          HorizontalAlignment="Right"
+          VerticalAlignment="Top"
+          Margin="12"
+          Padding="10,6"
+          Background="#E6202938"
+          BorderBrush="#FF2F81F7"
+          BorderThickness="1"
+          CornerRadius="4"
+          IsHitTestVisible="False">
+        <TextBlock
+            FontSize="13"
+            FontWeight="SemiBold"
+            Foreground="#FFFFFFFF"
+            Text="Avalonia overlay" />
+      </Border>
+    </Grid>
+
+    <Border Grid.Row="2" Padding="10" Background="#FFFFFF" BorderBrush="#D0D7DE" BorderThickness="0,1,0,0">
+      <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto" RowSpacing="8">
+        <TextBlock x:Name="StatusTextBlock" Grid.Row="0" Grid.Column="0" VerticalAlignment="Center" Text="Starting" />
+        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button MinWidth="82" Height="32" Click="ReloadButtonOnClick" Content="Reload" />
+          <Button MinWidth="92" Height="32" Click="ReadStateButtonOnClick" Content="Read State" />
+        </StackPanel>
+        <TextBlock x:Name="StateTextBlock" Grid.Row="1" Grid.ColumnSpan="2" TextWrapping="Wrap" />
+      </Grid>
+    </Border>
+  </Grid>
+</Window>

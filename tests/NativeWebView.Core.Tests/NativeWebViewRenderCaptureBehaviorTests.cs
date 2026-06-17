@@ -141,6 +141,35 @@ public sealed class NativeWebViewRenderCaptureBehaviorTests
         }
     }
 
+    [Theory]
+    [InlineData(NativeWebViewRenderMode.GpuSurface)]
+    [InlineData(NativeWebViewRenderMode.Offscreen)]
+    public void UpdateCapturedRenderSurface_EmptyNativeFrameDuringResize_KeepsRetainedSurface(
+        NativeWebViewRenderMode renderMode)
+    {
+        using var backend = new WindowsNativeWebViewBackend();
+        using var webView = new NativeWebView.Controls.NativeWebView(backend)
+        {
+            RenderMode = renderMode,
+        };
+
+        var retainedBitmap = CreateUninitializedBitmapSentinel();
+        SetRetainedCompositedBitmap(webView, renderMode, retainedBitmap);
+        SetSuppressEmptyResizeFramesUntil(webView, DateTimeOffset.UtcNow.AddSeconds(1));
+
+        try
+        {
+            var frame = CreateNativeFrame(renderMode, new byte[32]);
+            InvokeUpdateCapturedRenderSurface(webView, frame);
+
+            Assert.Same(retainedBitmap, GetRetainedCompositedBitmap(webView, renderMode));
+        }
+        finally
+        {
+            SetRetainedCompositedBitmap(webView, renderMode, value: null);
+        }
+    }
+
     [Fact]
     public async Task SaveRenderFrameWithMetadataAsync_CanceledToken_ThrowsOperationCanceledException()
     {
@@ -226,6 +255,18 @@ public sealed class NativeWebViewRenderCaptureBehaviorTests
         return field!;
     }
 
+    private static void SetSuppressEmptyResizeFramesUntil(
+        NativeWebView.Controls.NativeWebView webView,
+        DateTimeOffset value)
+    {
+        var field = typeof(NativeWebView.Controls.NativeWebView).GetField(
+            "_suppressEmptyResizeFramesUntilUtc",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        Assert.NotNull(field);
+        field!.SetValue(webView, value);
+    }
+
     private static NativeWebViewRenderFrame CreateSyntheticFrame(NativeWebViewRenderMode renderMode)
     {
         return new NativeWebViewRenderFrame(
@@ -239,6 +280,23 @@ public sealed class NativeWebViewRenderCaptureBehaviorTests
             capturedAtUtc: DateTimeOffset.UtcNow,
             renderMode: renderMode,
             origin: NativeWebViewRenderFrameOrigin.SyntheticFallback);
+    }
+
+    private static NativeWebViewRenderFrame CreateNativeFrame(
+        NativeWebViewRenderMode renderMode,
+        byte[] pixelData)
+    {
+        return new NativeWebViewRenderFrame(
+            pixelWidth: 4,
+            pixelHeight: 2,
+            bytesPerRow: 16,
+            pixelFormat: NativeWebViewRenderPixelFormat.Bgra8888Premultiplied,
+            pixelData: pixelData,
+            isSynthetic: false,
+            frameId: 1,
+            capturedAtUtc: DateTimeOffset.UtcNow,
+            renderMode: renderMode,
+            origin: NativeWebViewRenderFrameOrigin.NativeCapture);
     }
 
     private static void InvokeUpdateCapturedRenderSurface(

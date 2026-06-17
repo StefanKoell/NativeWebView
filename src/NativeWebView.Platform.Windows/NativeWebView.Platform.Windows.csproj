@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>NativeWebView.Platform.Windows</AssemblyName>
     <RootNamespace>NativeWebView.Platform.Windows</RootNamespace>
     <PackageId>NativeWebView.Platform.Windows</PackageId>
@@ -7,7 +8,8 @@
     <PackageTags>$(PackageTags);Windows;WebView2</PackageTags>
     <IsPackable>true</IsPackable>
     <DefineConstants>$(DefineConstants);NATIVEWEBVIEW_PLATFORM_WINDOWS</DefineConstants>
-    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <NoWarn>$(NoWarn);MSB3277;CA1416</NoWarn>
+    <WindowsSdkNetRefPath>$(NuGetPackageRoot)microsoft.windows.sdk.net.ref\10.0.19041.57\lib\net8.0\</WindowsSdkNetRefPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,5 +21,19 @@
     <PackageReference Include="Microsoft.Web.WebView2">
       <PrivateAssets>buildTransitive</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="System.Drawing.Common" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.Windows.SDK.NET">
+      <HintPath>$(WindowsSdkNetRefPath)Microsoft.Windows.SDK.NET.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="WinRT.Runtime">
+      <HintPath>$(WindowsSdkNetRefPath)WinRT.Runtime.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(WindowsSdkNetRefPath)Microsoft.Windows.SDK.NET.dll" Pack="true" PackagePath="lib\net10.0\" Visible="false" />
+    <None Include="$(WindowsSdkNetRefPath)WinRT.Runtime.dll" Pack="true" PackagePath="lib\net10.0\" Visible="false" />
   </ItemGroup>
 </Project>

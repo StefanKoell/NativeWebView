@@ -39,6 +39,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NativeWebView.Sample.Mobile
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NativeWebView.Sample.Diagnostics", "samples\NativeWebView.Sample.Diagnostics\NativeWebView.Sample.Diagnostics.csproj", "{4B77EF8C-DBC2-45EA-8691-A0952D2501A2}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NativeWebView.Sample.RenderModeComparison", "samples\NativeWebView.Sample.RenderModeComparison\NativeWebView.Sample.RenderModeComparison.csproj", "{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -229,6 +231,18 @@ Global
 		{4B77EF8C-DBC2-45EA-8691-A0952D2501A2}.Release|x64.Build.0 = Release|Any CPU
 		{4B77EF8C-DBC2-45EA-8691-A0952D2501A2}.Release|x86.ActiveCfg = Release|Any CPU
 		{4B77EF8C-DBC2-45EA-8691-A0952D2501A2}.Release|x86.Build.0 = Release|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Debug|x64.Build.0 = Debug|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Debug|x86.Build.0 = Debug|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Release|x64.ActiveCfg = Release|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Release|x64.Build.0 = Release|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Release|x86.ActiveCfg = Release|Any CPU
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -249,5 +263,6 @@ Global
 		{F68D0655-E832-455D-B5C2-1A206B1FF133} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 		{84F2A703-D7FB-46EA-B988-DED24563CF5F} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 		{4B77EF8C-DBC2-45EA-8691-A0952D2501A2} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{1E2055BC-FBB5-4B71-8957-FCD8687BBB4B} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
 	EndGlobalSection
 EndGlobal

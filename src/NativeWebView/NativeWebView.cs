@@ -1,10 +1,13 @@
 using System.Globalization;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
+using Avalonia.Rendering.Composition;
 using Avalonia.Threading;
 using NativeWebView.Core;
 using NativeWebView.Interop;
@@ -15,7 +18,7 @@ public class NativeWebView : NativeControlHost, IDisposable
 {
     private const int MinRenderFramesPerSecond = 1;
     private const int MaxRenderFramesPerSecond = 60;
-    private const int DefaultRenderFramesPerSecond = 30;
+    private const int DefaultRenderFramesPerSecond = 60;
 
     private static readonly SolidColorBrush RenderBackgroundBrush = new(Color.FromRgb(15, 23, 42));
     private static readonly SolidColorBrush RenderOutlineBrush = new(Color.FromArgb(180, 148, 163, 184));
@@ -48,19 +51,35 @@ public class NativeWebView : NativeControlHost, IDisposable
     private WriteableBitmap? _gpuSurfaceBitmap;
     private WriteableBitmap? _offscreenBitmap;
     private Vector _gpuSurfaceDpi = new(96, 96);
+    private Vector _offscreenDpi = new(96, 96);
+    private CompositionSurfaceVisual? _gpuCompositionVisual;
+    private CompositionDrawingSurface? _gpuCompositionSurface;
+    private ICompositionGpuInterop? _gpuCompositionInterop;
+    private ICompositionImportedGpuImage? _gpuCompositionImportedImage;
+    private IntPtr _gpuCompositionImportedHandle;
+    private string? _gpuCompositionImportedHandleType;
+    private int _gpuCompositionImportedWidth;
+    private int _gpuCompositionImportedHeight;
+    private long _gpuCompositionUpdatedFrameId;
 
     private bool _isAttached;
     private bool _frameCaptureInProgress;
+    private bool _gpuCompositionUpdateInProgress;
     private bool _isUsingSyntheticFrameSource;
     private bool _isMacOsCompositedPassthroughActive;
     private bool? _macOsCompositedPassthroughOverride;
+    private DateTimeOffset _suppressEmptyResizeFramesUntilUtc;
     private string? _renderDiagnosticsMessage;
+    private string? _gpuInteropDiagnosticsMessage;
 
     public static readonly StyledProperty<NativeWebViewRenderMode> RenderModeProperty =
         AvaloniaProperty.Register<NativeWebView, NativeWebViewRenderMode>(nameof(RenderMode), NativeWebViewRenderMode.Embedded);
 
     public static readonly StyledProperty<int> RenderFramesPerSecondProperty =
         AvaloniaProperty.Register<NativeWebView, int>(nameof(RenderFramesPerSecond), DefaultRenderFramesPerSecond);
+
+    public static readonly StyledProperty<bool> EnableExperimentalGpuInteropProperty =
+        AvaloniaProperty.Register<NativeWebView, bool>(nameof(EnableExperimentalGpuInterop));
 
     public NativeWebView()
         : this(new NativeWebViewInstance(), ownsInstance: true)
@@ -127,9 +146,15 @@ public class NativeWebView : NativeControlHost, IDisposable
         set => SetValue(RenderFramesPerSecondProperty, value);
     }
 
+    public bool EnableExperimentalGpuInterop
+    {
+        get => GetValue(EnableExperimentalGpuInteropProperty);
+        set => SetValue(EnableExperimentalGpuInteropProperty, value);
+    }
+
     public bool IsUsingSyntheticFrameSource => _isUsingSyntheticFrameSource;
 
-    public string? RenderDiagnosticsMessage => _renderDiagnosticsMessage;
+    public string? RenderDiagnosticsMessage => _gpuInteropDiagnosticsMessage ?? _renderDiagnosticsMessage;
 
     public NativeWebViewRenderStatistics RenderStatistics => _renderStatisticsTracker.CreateSnapshot();
 
@@ -636,6 +661,12 @@ public class NativeWebView : NativeControlHost, IDisposable
         var surface = RenderMode == NativeWebViewRenderMode.GpuSurface
             ? _gpuSurfaceBitmap ?? _offscreenBitmap
             : _offscreenBitmap ?? _gpuSurfaceBitmap;
+        var gpuFrame = TryGetLatestGpuFrame();
+
+        if (gpuFrame is not null && TryUpdateGpuCompositionSurface(gpuFrame, destinationRect))
+        {
+            return;
+        }
 
         if (surface is not null)
         {
@@ -644,7 +675,7 @@ public class NativeWebView : NativeControlHost, IDisposable
             return;
         }
 
-        if (!string.IsNullOrWhiteSpace(_renderDiagnosticsMessage))
+        if (!string.IsNullOrWhiteSpace(RenderDiagnosticsMessage))
         {
             DrawRenderFallback(context, destinationRect);
         }
@@ -777,6 +808,7 @@ public class NativeWebView : NativeControlHost, IDisposable
         base.OnDetachedFromVisualTree(e);
         _isAttached = false;
         StopFramePump();
+        DisposeGpuCompositionSurface();
     }
 
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
@@ -795,8 +827,17 @@ public class NativeWebView : NativeControlHost, IDisposable
             return;
         }
 
+        if (change.Property == EnableExperimentalGpuInteropProperty)
+        {
+            ApplyExperimentalGpuInteropState();
+            InvalidateVisual();
+            return;
+        }
+
         if (change.Property == BoundsProperty && RenderMode != NativeWebViewRenderMode.Embedded)
         {
+            _suppressEmptyResizeFramesUntilUtc = DateTimeOffset.UtcNow.AddMilliseconds(750);
+            UpdateGpuCompositionVisualBounds();
             _macOSHost?.UpdateLayoutForCurrentMode();
             SyncNativeHostCaptureSize();
             _ = CaptureAndRenderFrameAsync();
@@ -813,6 +854,7 @@ public class NativeWebView : NativeControlHost, IDisposable
     {
         StopFramePump();
         DisposeRenderSurfaces();
+        DisposeGpuCompositionSurface();
 
         _controller.CoreWebView2EnvironmentRequested -= OnCoreWebView2EnvironmentRequestedInternal;
         _controller.CoreWebView2ControllerOptionsRequested -= OnCoreWebView2ControllerOptionsRequestedInternal;
@@ -892,6 +934,7 @@ public class NativeWebView : NativeControlHost, IDisposable
     private void ApplyRenderModeState(bool forceRefresh)
     {
         ApplyRenderModeToNativeHost();
+        ApplyExperimentalGpuInteropState();
         UpdateMacOsCompositedPassthroughPolicy();
         _macOSHost?.UpdateLayoutForCurrentMode();
 
@@ -928,7 +971,7 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     private void EnsureFramePump()
     {
-        _framePump ??= new DispatcherTimer();
+        _framePump ??= new DispatcherTimer(DispatcherPriority.Render);
         _framePump.Interval = TimeSpan.FromMilliseconds(1000.0 / NormalizeRenderFramesPerSecond(RenderFramesPerSecond));
 
         if (!_framePump.IsEnabled)
@@ -997,7 +1040,11 @@ public class NativeWebView : NativeControlHost, IDisposable
             _isUsingSyntheticFrameSource = frame.IsSynthetic;
             _renderDiagnosticsMessage = null;
 
-            UpdateCapturedRenderSurface(frame);
+            if (!IsGpuCompositionRenderingActive())
+            {
+                UpdateCapturedRenderSurface(frame);
+            }
+
             _renderStatisticsTracker.MarkCaptureSuccess(frame);
             RaiseRenderFrameCaptured(frame);
             InvalidateVisual();
@@ -1021,9 +1068,393 @@ public class NativeWebView : NativeControlHost, IDisposable
         }
     }
 
+    protected override void OnPointerMoved(PointerEventArgs e)
+    {
+        if (TrySendCompositionPointerInput(e, NativeWebViewMouseInputKind.Move))
+        {
+            return;
+        }
+
+        base.OnPointerMoved(e);
+    }
+
+    protected override void OnPointerPressed(PointerPressedEventArgs e)
+    {
+        var kind = e.GetCurrentPoint(this).Properties.PointerUpdateKind switch
+        {
+            PointerUpdateKind.LeftButtonPressed => NativeWebViewMouseInputKind.LeftButtonDown,
+            PointerUpdateKind.RightButtonPressed => NativeWebViewMouseInputKind.RightButtonDown,
+            PointerUpdateKind.MiddleButtonPressed => NativeWebViewMouseInputKind.MiddleButtonDown,
+            _ => NativeWebViewMouseInputKind.Move,
+        };
+
+        if (TrySendCompositionPointerInput(e, kind, focus: true))
+        {
+            e.Pointer.Capture(this);
+            return;
+        }
+
+        base.OnPointerPressed(e);
+    }
+
+    protected override void OnPointerReleased(PointerReleasedEventArgs e)
+    {
+        var kind = e.GetCurrentPoint(this).Properties.PointerUpdateKind switch
+        {
+            PointerUpdateKind.LeftButtonReleased => NativeWebViewMouseInputKind.LeftButtonUp,
+            PointerUpdateKind.RightButtonReleased => NativeWebViewMouseInputKind.RightButtonUp,
+            PointerUpdateKind.MiddleButtonReleased => NativeWebViewMouseInputKind.MiddleButtonUp,
+            _ => NativeWebViewMouseInputKind.Move,
+        };
+
+        if (TrySendCompositionPointerInput(e, kind))
+        {
+            var properties = e.GetCurrentPoint(this).Properties;
+            if (!properties.IsLeftButtonPressed &&
+                !properties.IsRightButtonPressed &&
+                !properties.IsMiddleButtonPressed)
+            {
+                e.Pointer.Capture(null);
+            }
+
+            return;
+        }
+
+        base.OnPointerReleased(e);
+    }
+
+    protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
+    {
+        var kind = Math.Abs(e.Delta.X) > Math.Abs(e.Delta.Y)
+            ? NativeWebViewMouseInputKind.HorizontalWheel
+            : NativeWebViewMouseInputKind.Wheel;
+        var delta = kind == NativeWebViewMouseInputKind.HorizontalWheel
+            ? e.Delta.X
+            : e.Delta.Y;
+
+        if (TrySendCompositionPointerInput(e, kind, mouseData: (int)Math.Round(delta * 120)))
+        {
+            return;
+        }
+
+        base.OnPointerWheelChanged(e);
+    }
+
+    protected override void OnPointerExited(PointerEventArgs e)
+    {
+        if (TrySendCompositionPointerInput(e, NativeWebViewMouseInputKind.Leave))
+        {
+            return;
+        }
+
+        base.OnPointerExited(e);
+    }
+
+    private bool TrySendCompositionPointerInput(
+        PointerEventArgs e,
+        NativeWebViewMouseInputKind kind,
+        bool focus = false,
+        int mouseData = 0)
+    {
+        if (RenderMode == NativeWebViewRenderMode.Embedded ||
+            !_controller.TryGetBackend<INativeWebViewCompositionInputSink>(out var inputSink))
+        {
+            return false;
+        }
+
+        if (focus)
+        {
+            inputSink.FocusCompositionInput();
+        }
+
+        var scaling = TopLevel.GetTopLevel(this)?.RenderScaling ?? 1;
+        var position = kind == NativeWebViewMouseInputKind.Leave
+            ? default
+            : e.GetPosition(this);
+        var point = e.GetCurrentPoint(this);
+        var input = new NativeWebViewMouseInput(
+            kind,
+            CreateMouseModifiers(e, point.Properties),
+            (int)Math.Round(position.X * scaling, MidpointRounding.AwayFromZero),
+            (int)Math.Round(position.Y * scaling, MidpointRounding.AwayFromZero),
+            mouseData);
+
+        if (!inputSink.SendMouseInput(input))
+        {
+            return false;
+        }
+
+        e.Handled = true;
+        return true;
+    }
+
+    private NativeWebViewGpuFrame? TryGetLatestGpuFrame()
+    {
+        if (RenderMode == NativeWebViewRenderMode.Embedded ||
+            !EnableExperimentalGpuInterop ||
+            !_controller.TryGetBackend<INativeWebViewGpuFrameSource>(out var gpuFrameSource) ||
+            !gpuFrameSource.SupportsGpuFrame(RenderMode))
+        {
+            _gpuInteropDiagnosticsMessage = null;
+            return null;
+        }
+
+        return gpuFrameSource.TryGetLatestGpuFrame(RenderMode);
+    }
+
+    private void UpdateGpuInteropDiagnostics(string? message)
+    {
+        _gpuInteropDiagnosticsMessage = message;
+    }
+
+    private bool TryUpdateGpuCompositionSurface(NativeWebViewGpuFrame frame, Rect bounds)
+    {
+        if (frame.SharedHandle == 0 || string.IsNullOrWhiteSpace(frame.SharedHandleType))
+        {
+            UpdateGpuInteropDiagnostics("GPU composition interop: WebView frame does not expose a shared GPU handle.");
+            return false;
+        }
+
+        if (_gpuCompositionUpdatedFrameId == frame.FrameId)
+        {
+            UpdateGpuCompositionVisualBounds();
+            return true;
+        }
+
+        if (!_gpuCompositionUpdateInProgress)
+        {
+            _gpuCompositionUpdateInProgress = true;
+            Dispatcher.UIThread.Post(
+                () => _ = UpdateGpuCompositionSurfaceAsync(frame, bounds),
+                DispatcherPriority.Render);
+        }
+
+        return _gpuCompositionUpdatedFrameId > 0 &&
+               _gpuCompositionVisual is { Visible: true };
+    }
+
+    private async Task UpdateGpuCompositionSurfaceAsync(NativeWebViewGpuFrame frame, Rect bounds)
+    {
+        try
+        {
+            var compositionVisual = ElementComposition.GetElementVisual(this);
+            if (compositionVisual is null)
+            {
+                UpdateGpuInteropDiagnostics("GPU composition interop: Avalonia composition visual is unavailable.");
+                return;
+            }
+
+            var compositor = compositionVisual.Compositor;
+            _gpuCompositionInterop ??= await compositor.TryGetCompositionGpuInterop();
+            if (_gpuCompositionInterop is null || _gpuCompositionInterop.IsLost)
+            {
+                UpdateGpuInteropDiagnostics("GPU composition interop: Avalonia compositor GPU interop is unavailable.");
+                return;
+            }
+
+            if (!_gpuCompositionInterop.SupportedImageHandleTypes.Contains(frame.SharedHandleType))
+            {
+                UpdateGpuInteropDiagnostics(
+                    $"GPU composition interop: handle type '{frame.SharedHandleType}' is not supported by this Avalonia compositor.");
+                return;
+            }
+
+            EnsureGpuCompositionVisual(compositor, bounds);
+
+            if (_gpuCompositionImportedImage is null ||
+                _gpuCompositionImportedHandle != frame.SharedHandle ||
+                _gpuCompositionImportedHandleType != frame.SharedHandleType ||
+                _gpuCompositionImportedWidth != frame.PixelWidth ||
+                _gpuCompositionImportedHeight != frame.PixelHeight)
+            {
+                ClearImportedGpuImage();
+
+                var properties = new PlatformGraphicsExternalImageProperties
+                {
+                    Width = frame.PixelWidth,
+                    Height = frame.PixelHeight,
+                    Format = PlatformGraphicsExternalImageFormat.B8G8R8A8UNorm,
+                    TopLeftOrigin = true,
+                };
+
+                _gpuCompositionImportedImage = _gpuCompositionInterop.ImportImage(
+                    new PlatformHandle(frame.SharedHandle, frame.SharedHandleType),
+                    properties);
+                _gpuCompositionImportedHandle = frame.SharedHandle;
+                _gpuCompositionImportedHandleType = frame.SharedHandleType;
+                _gpuCompositionImportedWidth = frame.PixelWidth;
+                _gpuCompositionImportedHeight = frame.PixelHeight;
+            }
+
+            if (_gpuCompositionSurface is null || _gpuCompositionImportedImage is null)
+            {
+                return;
+            }
+
+            if (frame.RequiresKeyedMutex)
+            {
+                await _gpuCompositionSurface.UpdateWithKeyedMutexAsync(
+                    _gpuCompositionImportedImage,
+                    frame.KeyedMutexAcquireKey,
+                    frame.KeyedMutexReleaseKey);
+            }
+            else
+            {
+                await _gpuCompositionSurface.UpdateAsync(_gpuCompositionImportedImage);
+            }
+
+            _gpuCompositionUpdatedFrameId = frame.FrameId;
+            _gpuInteropDiagnosticsMessage = null;
+            _gpuCompositionVisual!.Visible = true;
+            SetGpuFrameOnlyRenderingEnabled(true);
+            InvalidateVisual();
+        }
+        catch (Exception ex)
+        {
+            UpdateGpuInteropDiagnostics($"GPU composition interop failed: {ex.GetType().Name}: {ex.Message}");
+            SetGpuFrameOnlyRenderingEnabled(false);
+            DisposeGpuCompositionSurface();
+        }
+        finally
+        {
+            _gpuCompositionUpdateInProgress = false;
+        }
+    }
+
+    private void EnsureGpuCompositionVisual(Compositor compositor, Rect bounds)
+    {
+        if (_gpuCompositionVisual is null)
+        {
+            _gpuCompositionSurface = compositor.CreateDrawingSurface();
+            _gpuCompositionVisual = compositor.CreateSurfaceVisual();
+            _gpuCompositionVisual.Surface = _gpuCompositionSurface;
+            _gpuCompositionVisual.ClipToBounds = true;
+            _gpuCompositionVisual.Visible = false;
+            ElementComposition.SetElementChildVisual(this, _gpuCompositionVisual);
+        }
+
+        UpdateGpuCompositionVisualBounds(bounds);
+    }
+
+    private void UpdateGpuCompositionVisualBounds()
+    {
+        UpdateGpuCompositionVisualBounds(new Rect(Bounds.Size));
+    }
+
+    private void UpdateGpuCompositionVisualBounds(Rect bounds)
+    {
+        if (_gpuCompositionVisual is null)
+        {
+            return;
+        }
+
+        _gpuCompositionVisual.Offset = new Vector3D(bounds.X, bounds.Y, 0);
+        _gpuCompositionVisual.Size = new Vector(Math.Max(0, bounds.Width), Math.Max(0, bounds.Height));
+    }
+
+    private void DisposeGpuCompositionSurface()
+    {
+        ElementComposition.SetElementChildVisual(this, null);
+        ClearImportedGpuImage();
+        _gpuCompositionSurface?.Dispose();
+        _gpuCompositionSurface = null;
+        _gpuCompositionVisual = null;
+        _gpuCompositionInterop = null;
+        _gpuCompositionUpdatedFrameId = 0;
+        _gpuCompositionUpdateInProgress = false;
+        SetGpuFrameOnlyRenderingEnabled(false);
+    }
+
+    private void ClearImportedGpuImage()
+    {
+        if (_gpuCompositionImportedImage is not null)
+        {
+            _ = _gpuCompositionImportedImage.DisposeAsync().AsTask();
+        }
+
+        _gpuCompositionImportedImage = null;
+        _gpuCompositionImportedHandle = 0;
+        _gpuCompositionImportedHandleType = null;
+        _gpuCompositionImportedWidth = 0;
+        _gpuCompositionImportedHeight = 0;
+        _gpuCompositionUpdatedFrameId = 0;
+    }
+
+    private bool IsGpuCompositionRenderingActive()
+    {
+        return EnableExperimentalGpuInterop &&
+               RenderMode != NativeWebViewRenderMode.Embedded &&
+               _gpuCompositionVisual is { Visible: true } &&
+               _gpuCompositionUpdatedFrameId > 0;
+    }
+
+    private void SetGpuFrameOnlyRenderingEnabled(bool enabled)
+    {
+        if (_controller.TryGetBackend<INativeWebViewGpuFrameSource>(out var gpuFrameSource))
+        {
+            gpuFrameSource.SetGpuFrameOnlyRenderingEnabled(
+                enabled &&
+                EnableExperimentalGpuInterop &&
+                RenderMode != NativeWebViewRenderMode.Embedded &&
+                gpuFrameSource.SupportsGpuFrame(RenderMode));
+        }
+    }
+
+    private static NativeWebViewMouseInputModifiers CreateMouseModifiers(
+        PointerEventArgs e,
+        PointerPointProperties properties)
+    {
+        var modifiers = NativeWebViewMouseInputModifiers.None;
+
+        if (properties.IsLeftButtonPressed)
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.LeftButton;
+        }
+
+        if (properties.IsRightButtonPressed)
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.RightButton;
+        }
+
+        if (properties.IsMiddleButtonPressed)
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.MiddleButton;
+        }
+
+        if (properties.IsXButton1Pressed)
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.XButton1;
+        }
+
+        if (properties.IsXButton2Pressed)
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.XButton2;
+        }
+
+        if (e.KeyModifiers.HasFlag(KeyModifiers.Shift))
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.Shift;
+        }
+
+        if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
+        {
+            modifiers |= NativeWebViewMouseInputModifiers.Control;
+        }
+
+        return modifiers;
+    }
+
     private void UpdateCapturedRenderSurface(NativeWebViewRenderFrame frame)
     {
         if (frame.IsSynthetic && HasRetainedCompositedFrame(RenderMode))
+        {
+            return;
+        }
+
+        if (!frame.IsSynthetic &&
+            HasRetainedCompositedFrame(RenderMode) &&
+            DateTimeOffset.UtcNow <= _suppressEmptyResizeFramesUntilUtc &&
+            IsLikelyEmptyFrame(frame))
         {
             return;
         }
@@ -1107,16 +1538,21 @@ public class NativeWebView : NativeControlHost, IDisposable
         }
 
         var frameDpi = ResolveFrameDpi(frame.PixelWidth, frame.PixelHeight);
-        var offscreen = new WriteableBitmap(
-            new PixelSize(frame.PixelWidth, frame.PixelHeight),
-            frameDpi,
-            PixelFormat.Bgra8888,
-            AlphaFormat.Premul);
+        if (_offscreenBitmap is null ||
+            _offscreenBitmap.PixelSize.Width != frame.PixelWidth ||
+            _offscreenBitmap.PixelSize.Height != frame.PixelHeight ||
+            !AreClose(_offscreenDpi, frameDpi))
+        {
+            DisposeOffscreenSurface();
+            _offscreenBitmap = new WriteableBitmap(
+                new PixelSize(frame.PixelWidth, frame.PixelHeight),
+                frameDpi,
+                PixelFormat.Bgra8888,
+                AlphaFormat.Premul);
+            _offscreenDpi = frameDpi;
+        }
 
-        CopyFramePixels(frame, offscreen);
-
-        _offscreenBitmap?.Dispose();
-        _offscreenBitmap = offscreen;
+        CopyFramePixels(frame, _offscreenBitmap);
     }
 
     private static void CopyFramePixels(NativeWebViewRenderFrame frame, WriteableBitmap bitmap)
@@ -1188,7 +1624,7 @@ public class NativeWebView : NativeControlHost, IDisposable
         context.FillRectangle(RenderBackgroundBrush, destinationRect);
         context.DrawRectangle(null, new Pen(RenderOutlineBrush, 1), destinationRect.Deflate(0.5));
 
-        var status = _renderDiagnosticsMessage ??
+        var status = RenderDiagnosticsMessage ??
                      $"{RenderMode} active. Waiting for first rendered web frame.";
         var formattedText = new FormattedText(
             status,
@@ -1218,6 +1654,42 @@ public class NativeWebView : NativeControlHost, IDisposable
     {
         _offscreenBitmap?.Dispose();
         _offscreenBitmap = null;
+        _offscreenDpi = new Vector(96, 96);
+    }
+
+    private static bool IsLikelyEmptyFrame(NativeWebViewRenderFrame frame)
+    {
+        if (frame.PixelData.Length == 0 || frame.PixelWidth <= 0 || frame.PixelHeight <= 0)
+        {
+            return true;
+        }
+
+        var sampleStep = Math.Max(1, frame.PixelWidth * frame.PixelHeight / 2048);
+        var sampled = 0;
+        var nearBlack = 0;
+
+        for (var pixel = 0; pixel < frame.PixelWidth * frame.PixelHeight; pixel += sampleStep)
+        {
+            var row = pixel / frame.PixelWidth;
+            var column = pixel % frame.PixelWidth;
+            var offset = row * frame.BytesPerRow + column * 4;
+            if (offset + 3 >= frame.PixelData.Length)
+            {
+                continue;
+            }
+
+            sampled++;
+            var blue = frame.PixelData[offset];
+            var green = frame.PixelData[offset + 1];
+            var red = frame.PixelData[offset + 2];
+            var alpha = frame.PixelData[offset + 3];
+            if (alpha <= 4 || red + green + blue <= 12)
+            {
+                nearBlack++;
+            }
+        }
+
+        return sampled > 0 && nearBlack >= sampled * 0.995;
     }
 
     private bool TryCreateFrameRequest(out NativeWebViewRenderFrameRequest request)
@@ -1253,12 +1725,34 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     private void ApplyRenderModeToNativeHost()
     {
+        if (_controller.TryGetBackend<INativeWebViewRenderModeTarget>(out var renderModeTarget))
+        {
+            renderModeTarget.SetRenderMode(RenderMode);
+        }
+
         if (_macOSHost is null)
         {
             return;
         }
 
         _macOSHost.SetRenderMode(RenderMode);
+    }
+
+    private void ApplyExperimentalGpuInteropState()
+    {
+        if (_controller.TryGetBackend<INativeWebViewGpuFrameSource>(out var gpuFrameSource))
+        {
+            gpuFrameSource.SetGpuFrameCaptureEnabled(
+                EnableExperimentalGpuInterop &&
+                RenderMode != NativeWebViewRenderMode.Embedded &&
+                gpuFrameSource.SupportsGpuFrame(RenderMode));
+        }
+
+        if (!EnableExperimentalGpuInterop || RenderMode == NativeWebViewRenderMode.Embedded)
+        {
+            _gpuInteropDiagnosticsMessage = null;
+            DisposeGpuCompositionSurface();
+        }
     }
 
     private void SyncNativeHostCaptureSize()

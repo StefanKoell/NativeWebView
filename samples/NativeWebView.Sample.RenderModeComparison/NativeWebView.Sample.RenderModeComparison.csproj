@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>NativeWebView.Sample.RenderModeComparison</AssemblyName>
+    <RootNamespace>NativeWebView.Sample.RenderModeComparison</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/NativeWebView/NativeWebView.csproj" />
+    <ProjectReference Include="../../src/NativeWebView.Core/NativeWebView.Core.csproj" />
+    <ProjectReference Include="../../src/NativeWebView.Interop/NativeWebView.Interop.csproj" />
+    <ProjectReference Include="../../src/NativeWebView.Platform.Windows/NativeWebView.Platform.Windows.csproj" />
+    <ProjectReference Include="../../src/NativeWebView.Platform.macOS/NativeWebView.Platform.macOS.csproj" />
+    <ProjectReference Include="../../src/NativeWebView.Platform.Linux/NativeWebView.Platform.Linux.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Desktop" />
+    <PackageReference Include="Avalonia.Themes.Fluent" />
+  </ItemGroup>
+</Project>
