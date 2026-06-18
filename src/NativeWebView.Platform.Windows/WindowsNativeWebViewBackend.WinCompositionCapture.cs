@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Windows.Foundation;
 using Windows.Graphics;
@@ -16,7 +17,9 @@ public sealed partial class WindowsNativeWebViewBackend
 {
     private sealed class WinCompositionCaptureHost : IDisposable
     {
+        private const int FramePoolBufferCount = 3;
         private readonly object _gate = new();
+        private readonly object _frameDrainGate = new();
         private readonly Compositor _compositor;
         private readonly IDirect3DDevice _winRtDevice;
         private readonly D3D.ID3D11Device _d3d11Device;
@@ -29,11 +32,27 @@ public sealed partial class WindowsNativeWebViewBackend
         private SizeInt32 _currentSize;
         private NativeWebViewRenderFrame? _latestFrame;
         private NativeWebViewGpuFrame? _latestGpuFrame;
-        private D3D.ID3D11Texture2D? _latestGpuTexture;
-        private int _latestGpuTextureWidth;
-        private int _latestGpuTextureHeight;
+        private GpuTextureSlot[] _gpuTextureSlots = [];
+        private int _gpuTextureSlotIndex = -1;
+        private int _gpuTextureSlotsWidth;
+        private int _gpuTextureSlotsHeight;
         private bool _gpuFrameCaptureEnabled;
         private bool _gpuFrameOnlyRenderingEnabled;
+        private NativeWebViewRenderMode _currentRenderMode = NativeWebViewRenderMode.Offscreen;
+        private long _frameSequence;
+        private int _pendingFrameArrived;
+        private long _frameArrivedSignalCount;
+        private long _gpuFrameCopyCount;
+        private long _gpuFrameCopyElapsedTicks;
+        private long _gpuFrameCopyMaxTicks;
+        private long _cpuFrameCopyCount;
+        private long _retainedGpuOnlyFrameReturnCount;
+        private long _latestGpuFrameId;
+        private long _latestCpuFrameId;
+        private long _latestGpuFrameCapturedAtUtcTicks;
+        private long _latestCpuFrameCapturedAtUtcTicks;
+        private long _freshGpuFrameDemandUntilUtcTicks;
+        private int _freshGpuFrameCommitPulseRunning;
         private bool _disposed;
 
         public WinCompositionCaptureHost()
@@ -43,6 +62,8 @@ public sealed partial class WindowsNativeWebViewBackend
             WebViewVisual = _compositor.CreateContainerVisual();
             _winRtDevice = D3D.CreateDevice(out _d3d11Device, out _d3d11Context);
         }
+
+        public event EventHandler? FrameArrived;
 
         public ContainerVisual WebViewVisual { get; }
 
@@ -69,10 +90,7 @@ public sealed partial class WindowsNativeWebViewBackend
                 if (!enabled)
                 {
                     _latestGpuFrame = null;
-                    ReleaseComObject(_latestGpuTexture);
-                    _latestGpuTexture = null;
-                    _latestGpuTextureWidth = 0;
-                    _latestGpuTextureHeight = 0;
+                    ReleaseGpuTextureSlots();
                 }
             }
         }
@@ -85,6 +103,111 @@ public sealed partial class WindowsNativeWebViewBackend
             }
         }
 
+        public void RequestFreshGpuFrames(TimeSpan duration)
+        {
+            var untilTicks = DateTimeOffset.UtcNow.Add(duration).UtcTicks;
+            var current = Interlocked.Read(ref _freshGpuFrameDemandUntilUtcTicks);
+            while (untilTicks > current &&
+                   Interlocked.CompareExchange(ref _freshGpuFrameDemandUntilUtcTicks, untilTicks, current) != current)
+            {
+                current = Interlocked.Read(ref _freshGpuFrameDemandUntilUtcTicks);
+            }
+
+            _ = _compositor.RequestCommitAsync();
+            EnsureFreshGpuFrameCommitPulse();
+        }
+
+        private void EnsureFreshGpuFrameCommitPulse()
+        {
+            if (Interlocked.Exchange(ref _freshGpuFrameCommitPulseRunning, 1) != 0)
+            {
+                return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!_disposed && IsFreshGpuFrameDemandActive())
+                    {
+                        _ = _compositor.RequestCommitAsync();
+                        await Task.Delay(16).ConfigureAwait(false);
+                    }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _freshGpuFrameCommitPulseRunning, 0);
+                    if (!_disposed && IsFreshGpuFrameDemandActive())
+                    {
+                        EnsureFreshGpuFrameCommitPulse();
+                    }
+                }
+            });
+        }
+
+        public NativeWebViewGpuFrameDiagnosticsSnapshot GetGpuFrameDiagnosticsSnapshot()
+        {
+            lock (_gate)
+            {
+                return new NativeWebViewGpuFrameDiagnosticsSnapshot(
+                    NativeWebViewGpuFrameTransport.WindowsGraphicsCaptureSharedD3D11Texture,
+                    _currentRenderMode,
+                    _currentRenderMode,
+                    _currentSize.Width,
+                    _currentSize.Height,
+                    0,
+                    _gpuFrameCaptureEnabled,
+                    _gpuFrameOnlyRenderingEnabled,
+                    false,
+                    false,
+                    false,
+                    0,
+                    0,
+                    Interlocked.Read(ref _frameArrivedSignalCount),
+                    Interlocked.Read(ref _gpuFrameCopyCount),
+                    Interlocked.Read(ref _cpuFrameCopyCount),
+                    Interlocked.Read(ref _retainedGpuOnlyFrameReturnCount),
+                    Interlocked.Read(ref _latestGpuFrameId),
+                    Interlocked.Read(ref _latestCpuFrameId),
+                    GetFrameAgeMilliseconds(Interlocked.Read(ref _latestGpuFrameCapturedAtUtcTicks)),
+                    GetFrameAgeMilliseconds(Interlocked.Read(ref _latestCpuFrameCapturedAtUtcTicks)),
+                    0,
+                    GetElapsedMicroseconds(Interlocked.Read(ref _gpuFrameCopyElapsedTicks)),
+                    GetAverageMicroseconds(
+                        Interlocked.Read(ref _gpuFrameCopyElapsedTicks),
+                        Interlocked.Read(ref _gpuFrameCopyCount)),
+                    GetElapsedMicroseconds(Interlocked.Read(ref _gpuFrameCopyMaxTicks)),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null,
+                    null,
+                    null,
+                    0,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0);
+            }
+        }
+
         public async Task<NativeWebViewRenderFrame?> CaptureFrameAsync(
             NativeWebViewRenderMode renderMode,
             NativeWebViewRenderFrameRequest request,
@@ -92,33 +215,46 @@ public sealed partial class WindowsNativeWebViewBackend
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            EnsureCaptureSession(request.PixelWidth, request.PixelHeight);
+            lock (_gate)
+            {
+                _currentRenderMode = renderMode;
+            }
 
-            if (TryCaptureLatestAvailableFrame(renderMode, frameId, out var availableFrame))
+            EnsureCaptureSession(request.PixelWidth, request.PixelHeight);
+            _ = _compositor.RequestCommitAsync();
+
+            if (TryDrainLatestAvailableFrame(renderMode, out var availableFrame))
             {
                 return availableFrame;
             }
 
-            lock (_gate)
+            if (!HasPendingFrameArrived() &&
+                TryGetLatestRetainedFrame(gpuOnly: true, out var retainedGpuOnlyFrame))
             {
-                if (_latestFrame is not null)
-                {
-                    return _latestFrame;
-                }
+                Interlocked.Increment(ref _retainedGpuOnlyFrameReturnCount);
+                return retainedGpuOnlyFrame;
             }
 
             for (var attempt = 0; attempt < 6; attempt++)
             {
                 await Task.Delay(16, cancellationToken).ConfigureAwait(true);
-                if (TryCaptureLatestAvailableFrame(renderMode, frameId, out availableFrame))
+                if (TryDrainLatestAvailableFrame(renderMode, out availableFrame))
                 {
                     return availableFrame;
                 }
             }
 
+            return TryGetLatestRetainedFrame(gpuOnly: false, out var retainedFrame)
+                ? retainedFrame
+                : null;
+        }
+
+        private bool TryGetLatestRetainedFrame(bool gpuOnly, out NativeWebViewRenderFrame? frame)
+        {
             lock (_gate)
             {
-                return _latestFrame;
+                frame = _latestFrame;
+                return frame is not null && (!gpuOnly || _gpuFrameOnlyRenderingEnabled);
             }
         }
 
@@ -142,8 +278,9 @@ public sealed partial class WindowsNativeWebViewBackend
                 _framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
                     _winRtDevice,
                     DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                    3,
+                    FramePoolBufferCount,
                     _currentSize);
+                _framePool.FrameArrived += FramePoolOnFrameArrived;
                 _captureSession = _framePool.CreateCaptureSession(_captureItem);
                 _captureSession.StartCapture();
                 return;
@@ -155,14 +292,38 @@ public sealed partial class WindowsNativeWebViewBackend
                 _framePool.Recreate(
                     _winRtDevice,
                     DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                    3,
+                    FramePoolBufferCount,
                     _currentSize);
             }
         }
 
-        private bool TryCaptureLatestAvailableFrame(
+        private void FramePoolOnFrameArrived(Direct3D11CaptureFramePool sender, object args)
+        {
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+            }
+
+            Interlocked.Exchange(ref _pendingFrameArrived, 1);
+            Interlocked.Increment(ref _frameArrivedSignalCount);
+            if (IsFreshGpuFrameDemandActive())
+            {
+                _ = _compositor.RequestCommitAsync();
+            }
+
+            FrameArrived?.Invoke(this, EventArgs.Empty);
+        }
+
+        private bool IsFreshGpuFrameDemandActive()
+        {
+            return Interlocked.Read(ref _freshGpuFrameDemandUntilUtcTicks) > DateTimeOffset.UtcNow.UtcTicks;
+        }
+
+        private bool TryDrainLatestAvailableFrame(
             NativeWebViewRenderMode renderMode,
-            long frameId,
             out NativeWebViewRenderFrame? renderedFrame)
         {
             renderedFrame = null;
@@ -173,44 +334,56 @@ public sealed partial class WindowsNativeWebViewBackend
 
             try
             {
-                while (true)
+                lock (_frameDrainGate)
                 {
-                    using var frame = _framePool.TryGetNextFrame();
-                    if (frame is null)
+                    Interlocked.Exchange(ref _pendingFrameArrived, 0);
+                    while (true)
                     {
-                        return renderedFrame is not null;
-                    }
-
-                    var useGpuOnly = false;
-                    NativeWebViewGpuFrame? gpuFrame = null;
-                    lock (_gate)
-                    {
-                        if (_gpuFrameCaptureEnabled)
+                        using var frame = _framePool.TryGetNextFrame();
+                        if (frame is null)
                         {
-                            gpuFrame = CopyFrameToGpu(frame, renderMode, frameId);
+                            return renderedFrame is not null;
+                        }
+
+                        var currentFrameId = Interlocked.Increment(ref _frameSequence);
+                        var useGpuOnly = false;
+                        var captureGpuFrame = false;
+                        NativeWebViewGpuFrame? gpuFrame = null;
+                        lock (_gate)
+                        {
+                            captureGpuFrame = _gpuFrameCaptureEnabled;
                             useGpuOnly = _gpuFrameOnlyRenderingEnabled && _latestFrame is not null;
                         }
-                    }
 
-                    if (!useGpuOnly)
-                    {
-                        renderedFrame = CopyFrameToCpu(frame, renderMode, frameId);
-                    }
-
-                    lock (_gate)
-                    {
-                        if (renderedFrame is not null)
+                        if (captureGpuFrame)
                         {
-                            _latestFrame = renderedFrame;
-                        }
-                        else
-                        {
-                            renderedFrame = _latestFrame;
+                            gpuFrame = CopyFrameToGpu(frame, renderMode, currentFrameId);
                         }
 
-                        if (gpuFrame is not null)
+                        if (!useGpuOnly)
                         {
-                            _latestGpuFrame = gpuFrame;
+                            renderedFrame = CopyFrameToCpu(frame, renderMode, currentFrameId);
+                        }
+
+                        lock (_gate)
+                        {
+                            if (renderedFrame is not null)
+                            {
+                                _latestFrame = renderedFrame;
+                                Interlocked.Exchange(ref _latestCpuFrameId, renderedFrame.FrameId);
+                                Interlocked.Exchange(ref _latestCpuFrameCapturedAtUtcTicks, renderedFrame.CapturedAtUtc.UtcTicks);
+                            }
+                            else
+                            {
+                                renderedFrame = _latestFrame;
+                            }
+
+                            if (gpuFrame is not null)
+                            {
+                                _latestGpuFrame = gpuFrame;
+                                Interlocked.Exchange(ref _latestGpuFrameId, gpuFrame.FrameId);
+                                Interlocked.Exchange(ref _latestGpuFrameCapturedAtUtcTicks, gpuFrame.CapturedAtUtc.UtcTicks);
+                            }
                         }
                     }
                 }
@@ -221,7 +394,53 @@ public sealed partial class WindowsNativeWebViewBackend
             }
         }
 
-        private NativeWebViewGpuFrame CopyFrameToGpu(
+        private bool HasPendingFrameArrived()
+        {
+            return Volatile.Read(ref _pendingFrameArrived) != 0;
+        }
+
+        private static long GetFrameAgeMilliseconds(long capturedAtUtcTicks)
+        {
+            if (capturedAtUtcTicks <= 0)
+            {
+                return -1;
+            }
+
+            var elapsedTicks = DateTimeOffset.UtcNow.UtcTicks - capturedAtUtcTicks;
+            return Math.Max(0, elapsedTicks / TimeSpan.TicksPerMillisecond);
+        }
+
+        private void RecordGpuFrameCopyElapsed(long elapsedTicks)
+        {
+            Interlocked.Add(ref _gpuFrameCopyElapsedTicks, elapsedTicks);
+            RecordMax(ref _gpuFrameCopyMaxTicks, elapsedTicks);
+        }
+
+        private static long GetAverageMicroseconds(long elapsedTicks, long count)
+        {
+            return count <= 0
+                ? 0
+                : GetElapsedMicroseconds(elapsedTicks / count);
+        }
+
+        private static long GetElapsedMicroseconds(long elapsedTicks)
+        {
+            return elapsedTicks <= 0
+                ? 0
+                : elapsedTicks * 1_000_000 / Stopwatch.Frequency;
+        }
+
+        private static void RecordMax(ref long target, long value)
+        {
+            var current = Interlocked.Read(ref target);
+            while (value > current &&
+                   Interlocked.CompareExchange(ref target, value, current) != current)
+            {
+                current = Interlocked.Read(ref target);
+            }
+        }
+
+        private NativeWebViewGpuFrame? CopyFrameToGpu(
             Direct3D11CaptureFrame frame,
             NativeWebViewRenderMode renderMode,
             long frameId)
@@ -233,41 +452,47 @@ public sealed partial class WindowsNativeWebViewBackend
             try
             {
                 sourceTexture = GetFrameTexture(frame);
-                if (_latestGpuTexture is null ||
-                    _latestGpuTextureWidth != width ||
-                    _latestGpuTextureHeight != height)
+                EnsureGpuTextureSlots(width, height);
+                GpuTextureSlot? copiedSlot = null;
+                var copyStarted = Stopwatch.GetTimestamp();
+                for (var attempt = 0; attempt < _gpuTextureSlots.Length; attempt++)
                 {
-                    ReleaseComObject(_latestGpuTexture);
-                    var desc = new D3D.Texture2DDescription
+                    var slot = TryGetWritableGpuTextureSlot();
+                    if (slot is null)
                     {
-                        Width = width,
-                        Height = height,
-                        MipLevels = 1,
-                        ArraySize = 1,
-                        Format = D3D.Format.B8G8R8A8_UNorm,
-                        SampleDescription = new D3D.DXGI_SAMPLE_DESC { Count = 1, Quality = 0 },
-                        Usage = D3D.D3D11_USAGE.Default,
-                        BindFlags = D3D.D3D11_BIND_FLAG.ShaderResource | D3D.D3D11_BIND_FLAG.RenderTarget,
-                        CpuAccessFlags = 0,
-                        OptionFlags = D3D.OptionFlags.SharedKeyedMutex,
-                    };
+                        break;
+                    }
 
-                    D3D.CreateD3D11Texture(_d3d11Device, desc, out _latestGpuTexture);
-                    _latestGpuTextureWidth = width;
-                    _latestGpuTextureHeight = height;
+                    if (!D3D.TryCopyResourceWithKeyedMutex(
+                            _d3d11Context,
+                            slot.Mutex,
+                            slot.Texture,
+                            sourceTexture,
+                            timeoutMilliseconds: 1))
+                    {
+                        continue;
+                    }
+
+                    copiedSlot = slot;
+                    break;
                 }
 
-                D3D.CopyResourceWithKeyedMutex(_d3d11Context, _latestGpuTexture, sourceTexture);
-                var sharedHandle = D3D.GetSharedHandle(_latestGpuTexture);
+                if (copiedSlot is null)
+                {
+                    return null;
+                }
+
+                RecordGpuFrameCopyElapsed(Stopwatch.GetTimestamp() - copyStarted);
+                Interlocked.Increment(ref _gpuFrameCopyCount);
                 return new NativeWebViewGpuFrame(
                     width,
                     height,
                     NativeWebViewGpuFrameBackend.D3D11Texture2D,
-                    _latestGpuTexture,
+                    copiedSlot.Texture,
                     frameId,
                     DateTimeOffset.UtcNow,
                     renderMode,
-                    sharedHandle,
+                    copiedSlot.SharedHandle,
                     D3D.D3D11TextureGlobalSharedHandleType,
                     requiresKeyedMutex: true,
                     keyedMutexAcquireKey: 1,
@@ -277,6 +502,69 @@ public sealed partial class WindowsNativeWebViewBackend
             {
                 ReleaseComObject(sourceTexture);
             }
+        }
+
+        private void EnsureGpuTextureSlots(int width, int height)
+        {
+            const int requestedSlotCount = 1;
+            if (_gpuTextureSlots.Length == requestedSlotCount &&
+                _gpuTextureSlotsWidth == width &&
+                _gpuTextureSlotsHeight == height)
+            {
+                return;
+            }
+
+            ReleaseGpuTextureSlots();
+            _gpuTextureSlots = new GpuTextureSlot[requestedSlotCount];
+            _gpuTextureSlotIndex = -1;
+            _gpuTextureSlotsWidth = width;
+            _gpuTextureSlotsHeight = height;
+
+            var desc = new D3D.Texture2DDescription
+            {
+                Width = width,
+                Height = height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = D3D.Format.B8G8R8A8_UNorm,
+                SampleDescription = new D3D.DXGI_SAMPLE_DESC { Count = 1, Quality = 0 },
+                Usage = D3D.D3D11_USAGE.Default,
+                BindFlags = D3D.D3D11_BIND_FLAG.ShaderResource | D3D.D3D11_BIND_FLAG.RenderTarget,
+                CpuAccessFlags = 0,
+                OptionFlags = D3D.OptionFlags.SharedKeyedMutex,
+            };
+
+            for (var index = 0; index < _gpuTextureSlots.Length; index++)
+            {
+                D3D.CreateD3D11Texture(_d3d11Device, desc, out var texture);
+                _gpuTextureSlots[index] = new GpuTextureSlot(
+                    texture,
+                    D3D.GetKeyedMutex(texture),
+                    D3D.GetSharedHandle(texture));
+            }
+        }
+
+        private GpuTextureSlot? TryGetWritableGpuTextureSlot()
+        {
+            if (_gpuTextureSlots.Length == 0)
+            {
+                return null;
+            }
+
+            for (var attempt = 0; attempt < _gpuTextureSlots.Length; attempt++)
+            {
+                var index = (_gpuTextureSlotIndex + 1 + attempt) % _gpuTextureSlots.Length;
+                var slot = _gpuTextureSlots[index];
+                if (slot is null)
+                {
+                    continue;
+                }
+
+                _gpuTextureSlotIndex = index;
+                return slot;
+            }
+
+            return null;
         }
 
         private NativeWebViewRenderFrame CopyFrameToCpu(
@@ -342,6 +630,7 @@ public sealed partial class WindowsNativeWebViewBackend
                 finally
                 {
                     _d3d11Context.Unmap(stagingTexture, 0);
+                    Interlocked.Increment(ref _cpuFrameCopyCount);
                 }
             }
             finally
@@ -393,19 +682,52 @@ public sealed partial class WindowsNativeWebViewBackend
 
             _disposed = true;
             _captureSession?.Dispose();
+            if (_framePool is not null)
+            {
+                _framePool.FrameArrived -= FramePoolOnFrameArrived;
+            }
+
             _framePool?.Dispose();
             _captureItem = null;
             _latestGpuFrame = null;
-            ReleaseComObject(_latestGpuTexture);
-            _latestGpuTexture = null;
-            _latestGpuTextureWidth = 0;
-            _latestGpuTextureHeight = 0;
+            ReleaseGpuTextureSlots();
             WebViewVisual.Dispose();
             _compositor.Dispose();
             _winRtDevice.Dispose();
             ReleaseComObject(_d3d11Context);
             ReleaseComObject(_d3d11Device);
             ReleaseComObject(_dispatcherQueueController);
+        }
+
+        private void ReleaseGpuTextureSlots()
+        {
+            foreach (var slot in _gpuTextureSlots)
+            {
+                if (slot is null)
+                {
+                    continue;
+                }
+
+                ReleaseComObject(slot.Mutex);
+                ReleaseComObject(slot.Texture);
+            }
+
+            _gpuTextureSlots = [];
+            _gpuTextureSlotIndex = -1;
+            _gpuTextureSlotsWidth = 0;
+            _gpuTextureSlotsHeight = 0;
+        }
+
+        private sealed class GpuTextureSlot(
+            D3D.ID3D11Texture2D texture,
+            D3D.IDXGIKeyedMutex mutex,
+            IntPtr sharedHandle)
+        {
+            public D3D.ID3D11Texture2D Texture { get; } = texture;
+
+            public D3D.IDXGIKeyedMutex Mutex { get; } = mutex;
+
+            public IntPtr SharedHandle { get; } = sharedHandle;
         }
 
         private static object? EnsureDispatcherQueue()
@@ -445,6 +767,7 @@ public sealed partial class WindowsNativeWebViewBackend
             public int ThreadType;
             public int ApartmentType;
         }
+
     }
 
     private static class D3D
@@ -455,6 +778,7 @@ public sealed partial class WindowsNativeWebViewBackend
         public const string D3D11TextureGlobalSharedHandleType = "D3D11TextureGlobalSharedHandle";
         public const int D3D11_SDK_VERSION = 7;
         public const int D3D11_CPU_ACCESS_READ = 0x20000;
+        public const int DXGI_ERROR_WAIT_TIMEOUT = unchecked((int)0x887A0027);
 
         public enum Format
         {
@@ -707,28 +1031,35 @@ public sealed partial class WindowsNativeWebViewBackend
             Marshal.ThrowExceptionForHR(context.CopyResource(destination, source));
         }
 
-        public static void CopyResourceWithKeyedMutex(
+        public static bool TryCopyResourceWithKeyedMutex(
             ID3D11DeviceContext context,
+            IDXGIKeyedMutex mutex,
             ID3D11Texture2D destination,
-            ID3D11Texture2D source)
+            ID3D11Texture2D source,
+            uint timeoutMilliseconds)
         {
-            var mutex = QueryInterface<IDXGIKeyedMutex>(destination, IDXGIKeyedMutexGuid);
+            _ = destination;
+            var acquireResult = mutex.AcquireSync(0, timeoutMilliseconds);
+            if (acquireResult == DXGI_ERROR_WAIT_TIMEOUT)
+            {
+                return false;
+            }
+
+            Marshal.ThrowExceptionForHR(acquireResult);
             try
             {
-                Marshal.ThrowExceptionForHR(mutex.AcquireSync(0, 100));
-                try
-                {
-                    CopyResource(context, destination, source);
-                }
-                finally
-                {
-                    Marshal.ThrowExceptionForHR(mutex.ReleaseSync(1));
-                }
+                CopyResource(context, destination, source);
+                return true;
             }
             finally
             {
-                Marshal.ReleaseComObject(mutex);
+                Marshal.ThrowExceptionForHR(mutex.ReleaseSync(1));
             }
+        }
+
+        public static IDXGIKeyedMutex GetKeyedMutex(ID3D11Texture2D texture)
+        {
+            return QueryInterface<IDXGIKeyedMutex>(texture, IDXGIKeyedMutexGuid);
         }
 
         public static IntPtr GetSharedHandle(ID3D11Texture2D texture)

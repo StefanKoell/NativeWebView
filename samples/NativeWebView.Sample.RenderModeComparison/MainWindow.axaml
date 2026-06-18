@@ -29,19 +29,23 @@
           RenderFramesPerSecond="60" />
 
       <Border
+          x:Name="OverlayProbe"
           HorizontalAlignment="Right"
           VerticalAlignment="Top"
           Margin="12"
-          Padding="10,6"
-          Background="#E6202938"
-          BorderBrush="#FF2F81F7"
-          BorderThickness="1"
+          Width="168"
+          Height="36"
+          Background="#FFFF00FF"
+          BorderBrush="#FF00FFFF"
+          BorderThickness="3"
           CornerRadius="4"
           IsHitTestVisible="False">
         <TextBlock
+            HorizontalAlignment="Center"
+            VerticalAlignment="Center"
             FontSize="13"
             FontWeight="SemiBold"
-            Foreground="#FFFFFFFF"
+            Foreground="#FF000000"
             Text="Avalonia overlay" />
       </Border>
     </Grid>

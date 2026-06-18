@@ -114,6 +114,8 @@ Exact `UserDataFolder`/`CacheFolder`/`CookieDataFolder`/`SessionDataFolder` beha
 - `GpuSurface` captures frames into a reusable Avalonia-backed surface.
 - `Offscreen` captures frames offscreen for fully managed composition paths.
 
+On Windows, the experimental GPU surface path is documented in [Windows GPU Surface Experiment](site/articles/rendering/windows-gpu-surface-experiment.md), including the current distinction between the overlay-preserving WGC shared-texture transport and the smoother but airspace-prone DirectComposition child-window transport.
+
 Useful runtime APIs:
 
 - `webView.SupportsRenderMode(mode)`

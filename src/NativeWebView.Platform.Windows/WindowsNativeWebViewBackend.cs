@@ -13,10 +13,13 @@ public sealed partial class WindowsNativeWebViewBackend
     : INativeWebViewBackend,
       INativeWebViewFrameSource,
       INativeWebViewGpuFrameSource,
+      INativeWebViewGpuFrameDiagnosticsSource,
+      INativeWebViewGpuFrameNotificationSource,
       INativeWebViewRenderModeTarget,
       INativeWebViewPlatformHandleProvider,
       INativeWebViewInstanceConfigurationTarget,
       INativeWebViewCompositionInputSink,
+      INativeWebViewCompositionCursorSource,
       INativeWebViewNativeControlAttachment
 {
     private const int EInvalidArgHResult = unchecked((int)0x80070057);
@@ -87,6 +90,8 @@ public sealed partial class WindowsNativeWebViewBackend
     private bool _suppressNextSameUrlNavigationCompletion;
     private int _compositionNavigationRetryVersion;
     private WinCompositionCaptureHost? _winCompositionCaptureHost;
+    private WinCompositionDirectHost? _winCompositionDirectHost;
+    private bool _gpuFrameCaptureRequested;
     private string? _headerString;
     private string? _userAgentString;
 
@@ -104,6 +109,8 @@ public sealed partial class WindowsNativeWebViewBackend
     public NativeWebViewPlatform Platform { get; }
 
     public IWebViewPlatformFeatures Features { get; }
+
+    public event EventHandler? GpuFrameArrived;
 
     public Uri? CurrentUrl => _currentUrl;
 
@@ -675,6 +682,36 @@ public sealed partial class WindowsNativeWebViewBackend
         }
     }
 
+    public bool SendKeyboardInput(uint message, nint wParam, nint lParam)
+    {
+        EnsureNotDisposed();
+
+        if (_compositionController is null)
+        {
+            return false;
+        }
+
+        var parentHandle = _parentWindowHandle != IntPtr.Zero
+            ? _parentWindowHandle
+            : _childWindowHandle;
+        if (parentHandle == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var posted = false;
+        Win32.EnumChildWindows(
+            parentHandle,
+            (childHandle, _) =>
+            {
+                posted |= Win32.PostMessage(childHandle, message, wParam, lParam);
+                return true;
+            },
+            IntPtr.Zero);
+
+        return posted;
+    }
+
     public bool SupportsRenderMode(NativeWebViewRenderMode renderMode)
     {
         return renderMode switch
@@ -747,18 +784,83 @@ public sealed partial class WindowsNativeWebViewBackend
             return null;
         }
 
-        _winCompositionCaptureHost?.SetGpuFrameCaptureEnabled(true);
+        SetGpuFrameCaptureEnabled(true);
         return _winCompositionCaptureHost?.TryGetLatestGpuFrame(renderMode);
     }
 
     public void SetGpuFrameCaptureEnabled(bool enabled)
     {
+        _gpuFrameCaptureRequested = enabled;
         _winCompositionCaptureHost?.SetGpuFrameCaptureEnabled(enabled);
     }
 
     public void SetGpuFrameOnlyRenderingEnabled(bool enabled)
     {
         _winCompositionCaptureHost?.SetGpuFrameOnlyRenderingEnabled(enabled);
+    }
+
+    public void RequestFreshGpuFrames(TimeSpan duration)
+    {
+        _winCompositionCaptureHost?.RequestFreshGpuFrames(duration);
+    }
+
+    public NativeWebViewGpuFrameDiagnosticsSnapshot GetGpuFrameDiagnosticsSnapshot()
+    {
+        var snapshot = _winCompositionCaptureHost?.GetGpuFrameDiagnosticsSnapshot() ?? default;
+        var directRequested = ShouldUseDirectCompositionHost();
+        var directHost = _winCompositionDirectHost;
+        var childWindow = GetNativeWindowSnapshot(_childWindowHandle);
+        var placeholderWindow = GetNativeWindowSnapshot(_nativeHostPlaceholderHandle);
+        var parentWindow = GetNativeWindowSnapshot(_parentWindowHandle);
+
+        return snapshot with
+        {
+            RequestedRenderMode = _renderMode,
+            EffectiveRenderMode = _renderMode,
+            Transport = directHost is not null
+                ? NativeWebViewGpuFrameTransport.DirectCompositionChildWindow
+                : snapshot.Transport,
+            IsDirectCompositionRequested = directRequested,
+            IsDirectCompositionActive = directHost is not null,
+            DirectCompositionWindowHandle = directHost?.WindowHandle.ToInt64() ?? 0,
+            NativeHostChildWindowHandle = childWindow.Handle,
+            IsNativeHostChildWindowVisible = childWindow.IsVisible,
+            NativeHostChildWindowLeft = childWindow.Left,
+            NativeHostChildWindowTop = childWindow.Top,
+            NativeHostChildWindowRight = childWindow.Right,
+            NativeHostChildWindowBottom = childWindow.Bottom,
+            NativeHostPlaceholderWindowHandle = placeholderWindow.Handle,
+            IsNativeHostPlaceholderWindowVisible = placeholderWindow.IsVisible,
+            NativeHostPlaceholderWindowLeft = placeholderWindow.Left,
+            NativeHostPlaceholderWindowTop = placeholderWindow.Top,
+            NativeHostPlaceholderWindowRight = placeholderWindow.Right,
+            NativeHostPlaceholderWindowBottom = placeholderWindow.Bottom,
+            NativeHostParentWindowHandle = parentWindow.Handle,
+            IsNativeHostParentWindowVisible = parentWindow.IsVisible,
+            NativeHostParentWindowLeft = parentWindow.Left,
+            NativeHostParentWindowTop = parentWindow.Top,
+            NativeHostParentWindowRight = parentWindow.Right,
+            NativeHostParentWindowBottom = parentWindow.Bottom
+        };
+    }
+
+    public nint CurrentCompositionCursorHandle => GetCompositionCursorHandle();
+
+    private static NativeWindowDiagnosticsSnapshot GetNativeWindowSnapshot(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || !Win32.IsWindow(handle))
+        {
+            return default;
+        }
+
+        _ = Win32.GetWindowRect(handle, out var rect);
+        return new NativeWindowDiagnosticsSnapshot(
+            handle.ToInt64(),
+            Win32.IsWindowVisible(handle),
+            rect.Left,
+            rect.Top,
+            rect.Right,
+            rect.Bottom);
     }
 
     private void UpdateCompositedCaptureSize(NativeWebViewRenderFrameRequest request)
@@ -1086,7 +1188,7 @@ public sealed partial class WindowsNativeWebViewBackend
             return;
         }
 
-        _ = Win32.ShowWindow(_nativeHostPlaceholderHandle, Win32.ShowWindowCommand.Hide);
+        _ = Win32.ShowWindow(_nativeHostPlaceholderHandle, Win32.ShowWindowCommand.ShowNoActivate);
         _ = Win32.SetWindowPos(
             _nativeHostPlaceholderHandle,
             IntPtr.Zero,
@@ -1094,7 +1196,7 @@ public sealed partial class WindowsNativeWebViewBackend
             -32000,
             1,
             1,
-            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate | Win32.SetWindowPosFlags.ShowWindow);
         HideNativeHostWrapperForCompositedRendering();
     }
 
@@ -1107,7 +1209,7 @@ public sealed partial class WindowsNativeWebViewBackend
             return;
         }
 
-        _ = Win32.ShowWindow(_parentWindowHandle, Win32.ShowWindowCommand.Hide);
+        _ = Win32.ShowWindow(_parentWindowHandle, Win32.ShowWindowCommand.ShowNoActivate);
         _ = Win32.SetWindowPos(
             _parentWindowHandle,
             IntPtr.Zero,
@@ -1115,7 +1217,7 @@ public sealed partial class WindowsNativeWebViewBackend
             -32000,
             1,
             1,
-            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate);
+            Win32.SetWindowPosFlags.NoZOrder | Win32.SetWindowPosFlags.NoActivate | Win32.SetWindowPosFlags.ShowWindow);
     }
 
     private void ShowNativeHostWrapperForEmbeddedRendering()
@@ -1569,6 +1671,11 @@ public sealed partial class WindowsNativeWebViewBackend
         _coreWebView.WebResourceRequested += OnWebResourceRequested;
         _coreWebView.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
         _controller.ZoomFactorChanged += OnZoomFactorChanged;
+
+        if (_compositionController is not null)
+        {
+            _compositionController.CursorChanged += OnCompositionCursorChanged;
+        }
     }
 
     private void DetachRuntimeEvents()
@@ -1612,6 +1719,54 @@ public sealed partial class WindowsNativeWebViewBackend
                 // Ignore teardown failures from a controller that is already invalid.
             }
         }
+
+        if (_compositionController is not null)
+        {
+            try
+            {
+                _compositionController.CursorChanged -= OnCompositionCursorChanged;
+            }
+            catch
+            {
+                // Ignore teardown failures from a composition controller that is already invalid.
+            }
+        }
+    }
+
+    private void OnCompositionCursorChanged(object? sender, object e)
+    {
+        _ = sender;
+        _ = e;
+
+        ApplyCompositionCursor();
+    }
+
+    private void ApplyCompositionCursor()
+    {
+        try
+        {
+            var cursorHandle = GetCompositionCursorHandle();
+            if (cursorHandle != IntPtr.Zero)
+            {
+                _ = Win32.SetCursor(cursorHandle);
+            }
+        }
+        catch
+        {
+            // Cursor updates are best-effort; input forwarding must continue even if WebView2 is tearing down.
+        }
+    }
+
+    private nint GetCompositionCursorHandle()
+    {
+        if (_compositionController is null)
+        {
+            return IntPtr.Zero;
+        }
+
+        return _compositionController.SystemCursorId != 0
+            ? Win32.LoadCursor(IntPtr.Zero, unchecked((int)_compositionController.SystemCursorId))
+            : _compositionController.Cursor;
     }
 
     private void DestroyRuntimeController()
@@ -1714,9 +1869,55 @@ public sealed partial class WindowsNativeWebViewBackend
             return;
         }
 
-        _winCompositionCaptureHost ??= new WinCompositionCaptureHost();
+        if (ShouldUseDirectCompositionHost())
+        {
+            EnsureDirectCompositionRoot();
+            return;
+        }
+
+        DestroyDirectCompositionHost();
+        if (_winCompositionCaptureHost is null)
+        {
+            _winCompositionCaptureHost = new WinCompositionCaptureHost();
+            _winCompositionCaptureHost.FrameArrived += OnCompositionCaptureFrameArrived;
+            _winCompositionCaptureHost.SetGpuFrameCaptureEnabled(_gpuFrameCaptureRequested);
+        }
+
         _compositionController.RootVisualTarget = _winCompositionCaptureHost.WebViewVisual;
         UpdateControllerBounds();
+    }
+
+    private void EnsureDirectCompositionRoot()
+    {
+        if (_compositionController is null || _childWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        DestroyCaptureCompositionHost();
+        if (_parentWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        EnsureChildWindowClassRegistered();
+        _winCompositionDirectHost ??= new WinCompositionDirectHost(_parentWindowHandle);
+        _winCompositionDirectHost.Resize(Math.Max(1, _lastAttachedWidth), Math.Max(1, _lastAttachedHeight));
+        _compositionController.RootVisualTarget = _winCompositionDirectHost.WebViewVisual;
+        ResizeChildWindowForCompositedRendering();
+        UpdateControllerBounds();
+    }
+
+    private static bool ShouldUseDirectCompositionHost()
+    {
+        var value = Environment.GetEnvironmentVariable("NATIVEWEBVIEW_WINDOWS_DIRECT_COMPOSITION");
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void OnCompositionCaptureFrameArrived(object? sender, EventArgs e)
+    {
+        GpuFrameArrived?.Invoke(this, EventArgs.Empty);
     }
 
     private void ApplyRenderModeVisibility()
@@ -2451,8 +2652,29 @@ public sealed partial class WindowsNativeWebViewBackend
             // Best-effort disconnect before releasing the host visual tree.
         }
 
-        _winCompositionCaptureHost?.Dispose();
+        DestroyCaptureCompositionHost();
+        DestroyDirectCompositionHost();
+    }
+
+    private void DestroyCaptureCompositionHost()
+    {
+        if (_winCompositionCaptureHost is not null)
+        {
+            _winCompositionCaptureHost.FrameArrived -= OnCompositionCaptureFrameArrived;
+            _winCompositionCaptureHost.Dispose();
+        }
+
         _winCompositionCaptureHost = null;
+    }
+
+    private void DestroyDirectCompositionHost()
+    {
+        if (_winCompositionDirectHost is not null)
+        {
+            _winCompositionDirectHost.Dispose();
+        }
+
+        _winCompositionDirectHost = null;
     }
 
     private static void EnsureChildWindowClassRegistered()
@@ -2515,6 +2737,14 @@ public sealed partial class WindowsNativeWebViewBackend
         }
     }
 
+    private readonly record struct NativeWindowDiagnosticsSnapshot(
+        long Handle,
+        bool IsVisible,
+        int Left,
+        int Top,
+        int Right,
+        int Bottom);
+
     private static class Win32
     {
         public const int CursorIdcArrow = 32512;
@@ -2544,6 +2774,7 @@ public sealed partial class WindowsNativeWebViewBackend
         internal static class ShowWindowCommand
         {
             public const int Hide = 0;
+            public const int ShowNoActivate = 4;
             public const int Show = 5;
         }
 
@@ -2584,6 +2815,8 @@ public sealed partial class WindowsNativeWebViewBackend
         }
 
         internal delegate IntPtr WndProc(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+
+        internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         internal static extern IntPtr GetModuleHandle(string? lpModuleName);
@@ -2632,13 +2865,28 @@ public sealed partial class WindowsNativeWebViewBackend
         internal static extern bool GetClientRect(IntPtr hWnd, out Rect lpRect);
 
         [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool GetWindowRect(IntPtr hWnd, out Rect lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern IntPtr LoadCursor(IntPtr hInstance, int lpCursorName);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr SetCursor(IntPtr hCursor);
+
         [DllImport("user32.dll", EntryPoint = "DefWindowProcW", SetLastError = true)]
         internal static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
         internal static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);

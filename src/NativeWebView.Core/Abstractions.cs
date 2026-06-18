@@ -122,6 +122,92 @@ public readonly record struct NativeWebViewMouseInput(
     int Y,
     int MouseData);
 
+public readonly record struct NativeWebViewInputDiagnosticsSnapshot(
+    bool IsGpuCompositionRenderingActive,
+    long CompositionTopLevelPointerEventCount,
+    long CompositionTopLevelPointerRejectedCount,
+    long CompositionWin32PointerMessageCount,
+    long CompositionWin32PointerRejectedCount,
+    int LastCompositionWin32ClientX,
+    int LastCompositionWin32ClientY,
+    double LastCompositionWin32TopLeftX,
+    double LastCompositionWin32TopLeftY,
+    double LastCompositionWin32LocalX,
+    double LastCompositionWin32LocalY,
+    long CompositionMouseInputForwardedCount,
+    long CompositionMouseInputFailedCount,
+    bool HasCompositionKeyboardFocus,
+    long CompositionKeyboardMessageCount,
+    long CompositionKeyboardMessageForwardedCount,
+    long CompositionKeyboardMessageRejectedCount,
+    uint LastCompositionKeyboardMessage,
+    NativeWebViewMouseInputKind? LastCompositionMouseInputKind,
+    int LastCompositionMouseInputX,
+    int LastCompositionMouseInputY,
+    int LastCompositionMouseInputData);
+
+public enum NativeWebViewGpuFrameTransport
+{
+    None,
+    WindowsGraphicsCaptureSharedD3D11Texture,
+    DirectCompositionChildWindow,
+}
+
+public readonly record struct NativeWebViewGpuFrameDiagnosticsSnapshot(
+    NativeWebViewGpuFrameTransport Transport,
+    NativeWebViewRenderMode RequestedRenderMode,
+    NativeWebViewRenderMode EffectiveRenderMode,
+    int RequestedFramePixelWidth,
+    int RequestedFramePixelHeight,
+    double RequestedFrameScale,
+    bool IsGpuFrameCaptureEnabled,
+    bool IsGpuFrameOnlyRenderingEnabled,
+    bool IsGpuFrameNotificationPumpActive,
+    bool IsDirectCompositionRequested,
+    bool IsDirectCompositionActive,
+    long FramePumpTickCount,
+    long GpuFrameArrivalCaptureScheduledCount,
+    long FrameArrivedSignalCount,
+    long GpuFrameCopyCount,
+    long CpuFrameCopyCount,
+    long RetainedGpuOnlyFrameReturnCount,
+    long LatestGpuFrameId,
+    long LatestCpuFrameId,
+    long LatestGpuFrameAgeMilliseconds,
+    long LatestCpuFrameAgeMilliseconds,
+    long DirectCompositionWindowHandle,
+    long GpuFrameCopyTotalMicroseconds,
+    long GpuFrameCopyAverageMicroseconds,
+    long GpuFrameCopyMaxMicroseconds,
+    long GpuCompositionUpdateCount,
+    long GpuCompositionUpdateTotalMicroseconds,
+    long GpuCompositionUpdateAverageMicroseconds,
+    long GpuCompositionUpdateMaxMicroseconds,
+    long GpuCompositionUpdateOver16MillisecondsCount,
+    long GpuCompositionUpdateOver33MillisecondsCount,
+    long GpuCompositionUpdateOver50MillisecondsCount,
+    string? GpuInteropSupportedImageHandleTypes,
+    string? GpuInteropSupportedSemaphoreTypes,
+    string? GpuInteropSynchronizationCapabilities,
+    long NativeHostChildWindowHandle,
+    bool IsNativeHostChildWindowVisible,
+    int NativeHostChildWindowLeft,
+    int NativeHostChildWindowTop,
+    int NativeHostChildWindowRight,
+    int NativeHostChildWindowBottom,
+    long NativeHostPlaceholderWindowHandle,
+    bool IsNativeHostPlaceholderWindowVisible,
+    int NativeHostPlaceholderWindowLeft,
+    int NativeHostPlaceholderWindowTop,
+    int NativeHostPlaceholderWindowRight,
+    int NativeHostPlaceholderWindowBottom,
+    long NativeHostParentWindowHandle,
+    bool IsNativeHostParentWindowVisible,
+    int NativeHostParentWindowLeft,
+    int NativeHostParentWindowTop,
+    int NativeHostParentWindowRight,
+    int NativeHostParentWindowBottom);
+
 public enum NativeWebViewPrintStatus
 {
     Success = 0,
@@ -651,6 +737,18 @@ public interface INativeWebViewGpuFrameSource
     void SetGpuFrameCaptureEnabled(bool enabled);
 
     void SetGpuFrameOnlyRenderingEnabled(bool enabled);
+
+    void RequestFreshGpuFrames(TimeSpan duration);
+}
+
+public interface INativeWebViewGpuFrameDiagnosticsSource
+{
+    NativeWebViewGpuFrameDiagnosticsSnapshot GetGpuFrameDiagnosticsSnapshot();
+}
+
+public interface INativeWebViewGpuFrameNotificationSource
+{
+    event EventHandler? GpuFrameArrived;
 }
 
 public enum NativeWebViewGpuFrameBackend
@@ -728,6 +826,13 @@ public interface INativeWebViewCompositionInputSink
     void FocusCompositionInput();
 
     bool SendMouseInput(NativeWebViewMouseInput input);
+
+    bool SendKeyboardInput(uint message, nint wParam, nint lParam);
+}
+
+public interface INativeWebViewCompositionCursorSource
+{
+    nint CurrentCompositionCursorHandle { get; }
 }
 
 public interface INativeWebViewBackend : IDisposable
