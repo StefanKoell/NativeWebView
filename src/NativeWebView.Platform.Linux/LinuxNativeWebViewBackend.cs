@@ -1545,7 +1545,11 @@ public sealed class LinuxNativeWebViewBackend
 
         if (TryGetDownloadItem(download, out var item))
         {
-            item.MarkFailed(LinuxNativeInterop.GetErrorMessageAndFree(error), "WebKitDownloadFailed");
+            var message = LinuxNativeInterop.GetErrorMessageAndFree(error);
+            if (item.Snapshot.State != NativeWebViewDownloadState.Canceled)
+            {
+                item.MarkFailed(message, "WebKitDownloadFailed");
+            }
         }
 
         RemoveDownloadItem(download);
