@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html data-lunet-theme-mode="system" data-lunet-theme-storage-key="lunet-theme" data-lunet-css-prefix="lunet" lang="en" itemscope itemtype="http://schema.org/WebPage">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="generator" content="lunet 1.0.10.0">
+    <script>(function(){const root=document.documentElement;const key=root.getAttribute("data-lunet-theme-storage-key")||"lunet-theme";const fallback=root.getAttribute("data-lunet-theme-mode")||"system";let stored=null;try{stored=localStorage.getItem(key);}catch(_){stored=null;}const mode=(stored==="light"||stored==="dark"||stored==="system")?stored:fallback;const prefersDark=window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches;const resolved=mode==="system"?(prefersDark?"dark":"light"):mode;root.setAttribute("data-lunet-theme-mode",mode);root.setAttribute("data-bs-theme",resolved);}());</script>
+    <link rel='icon' href='/NativeWebView/favicon.ico' sizes='32x32'>
+    <title>Lunet Docs Pipeline | NativeWebView</title>
+    <link rel="stylesheet" href="/NativeWebView/css/lite.css">
+    <script src="/NativeWebView/js/lite-defer.js" defer></script>
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@wieslawsoltes">
+<meta name="twitter:title" content="Lunet Docs Pipeline | NativeWebView">
+<meta name="twitter:description" content="Lunet Docs Pipeline This repository uses Lunet for authored documentation and generated .NET API reference. Site structure site/config.scriban: Lunet config, project metadata, base path, and api.dotnet setup site/menu.yml: top-level navigation site/readme.md: landing page site/articles/**: authored documentation pages site/articles/**/menu.yml: section sidebars site/images/**: site assets site/.lunet/css/template-main.css: precompiled template stylesheet (runtime Sass workaround) site/.lunet/css/site-overrides.css...">
+<meta name="twitter:image" content="https://wieslawsoltes.github.io/NativeWebView/images/logo.svg">
+<meta name="twitter:image:alt" content="Lunet Docs Pipeline | NativeWebView">
+<meta property="og:title" content="Lunet Docs Pipeline | NativeWebView">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://wieslawsoltes.github.io/NativeWebView">
+<meta property="og:description" content="Lunet Docs Pipeline This repository uses Lunet for authored documentation and generated .NET API reference. Site structure site/config.scriban: Lunet config, project metadata, base path, and api.dotnet setup site/menu.yml: top-level navigation site/readme.md: landing page site/articles/**: authored documentation pages site/articles/**/menu.yml: section sidebars site/images/**: site assets site/.lunet/css/template-main.css: precompiled template stylesheet (runtime Sass workaround) site/.lunet/css/site-overrides.css...">
+<meta property="og:image" content="https://wieslawsoltes.github.io/NativeWebView/images/logo.svg">
+<meta property="og:image:alt" content="Lunet Docs Pipeline | NativeWebView">
+  </head>
+  <body>
+
+    <div id="lunet" class="container">
+      <nav class="navbar navbar-expand-md sticky-top">
+        <a class="navbar-brand" href="/NativeWebView/">
+          <img class="lunet-logo" src="/NativeWebView/images/logo.svg" alt="NativeWebView" width="96" height="96">
+          <span class="visually-hidden">Home</span>
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+          data-bs-target="#navbarSupportedContent"
+          aria-controls="navbarSupportedContent"
+          aria-expanded="false"
+          aria-label="Toggle navigation">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div id="navbarSupportedContent" class="collapse navbar-collapse justify-content-between">
+<ol id='nav-id-home-0' class='navbar-nav nav-level0 show '>
+  <li id='nav-item-home-1' class='nav-item '>
+    <span class='nav-item-row'><a href='/NativeWebView/' class='nav-link  '><i class='bi bi-house-door' aria-hidden='true'></i> Home</a></span>  </li>
+  <li id='nav-item-home-2' class='nav-item  active'>
+    <span class='nav-item-row'><a href='/NativeWebView/articles/' class='nav-link  '><i class='bi bi-book' aria-hidden='true'></i> Docs</a></span>  </li>
+  <li id='nav-item-home-3' class='nav-item '>
+    <span class='nav-item-row'><a href='/NativeWebView/api/' class='nav-link  '><i class='bi bi-braces' aria-hidden='true'></i> API</a></span>  </li>
+</ol>
+          <ol class="navbar-nav flex-grow-1" style="padding-right: 0.5rem;">
+            <li class="nav-item w-100">
+                <div class="lunet-search dropdown w-100">
+                  <div class="input-group">
+                    <span class="input-group-text"><i class="bi bi-search"></i></span>
+                    <input id="search-input" type="search" class="form-control" placeholder="Search... (Alt+s)" aria-label="Search" aria-controls="search-results" data-bs-toggle="dropdown" data-bs-auto-close="outside" data-search-empty-message="Enter words to search..." data-search-no-results-message="No results found.">
+                    <ul id="search-results" class="dropdown-menu w-100 p-0" style="max-height: 50vh;" role="listbox" aria-labelledby="search-input"></ul>
+                  </div>
+                </div>
+            </li>
+          </ol>
+          <div class="d-flex align-items-center gap-2 flex-shrink-0 navbar-right">
+            <div class="dropdown">
+              <button
+                id="theme-mode-toggle"
+                class="btn btn-outline-secondary btn-sm lunet-theme-toggle dropdown-toggle"
+                type="button"
+                data-bs-toggle="dropdown"
+                aria-expanded="false"
+                aria-label="Theme">
+                <i class="bi bi-circle-half" data-lunet-theme-toggle-icon aria-hidden="true"></i>
+                <span
+                  data-lunet-theme-toggle-label
+                  data-theme-system-label="System"
+                  data-theme-light-label="Light"
+                  data-theme-dark-label="Dark">Theme</span>
+              </button>
+              <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="theme-mode-toggle">
+                <li><button class="dropdown-item" type="button" data-lunet-theme-choice="system"><i class="bi bi-circle-half me-2"></i>System</button></li>
+                <li><button class="dropdown-item" type="button" data-lunet-theme-choice="light"><i class="bi bi-sun-fill me-2"></i>Light</button></li>
+                <li><button class="dropdown-item" type="button" data-lunet-theme-choice="dark"><i class="bi bi-moon-stars-fill me-2"></i>Dark</button></li>
+              </ul>
+            </div>
+<ol id='nav-id-home2-0' class='navbar-nav nav-level0 show flex-shrink-0'>
+  <li id='nav-item-home2-1' class='nav-item '>
+    <span class='nav-item-row'><a href='https://github.com/wieslawsoltes/NativeWebView' class='nav-link  btn btn-info'><i class="bi bi-github"></i> GitHub</a></span>  </li>
+</ol>
+          </div>
+        </div>
+      </nav>
+      <div class="lunet lunet-articles">
+        <section data-prismjs-copy="" data-prismjs-copy-success="" data-prismjs-copy-timeout="1200" data-copy-tooltip="Copy to Clipboard." data-copy-tooltip-success="Copied!" data-copy-tooltip-error="Failed to copy!">
+
+<div class="container-xxl">
+  <div class="row">
+      <!-- Left sidebar - responsive offcanvas (offcanvas on mobile, visible sidebar on md+) -->
+      <nav id="docs-sidebar-menu" class="col-md-3 col-lg-3 col-xl-3 col-xxl-2 offcanvas-md offcanvas-start sticky-md-top menu-sidebar align-self-start order-1 order-md-0" tabindex="-1" aria-labelledby="docs-sidebar-menu-label" aria-expanded="true">
+        <div class="offcanvas-header">
+          <h5 class="offcanvas-title" id="docs-sidebar-menu-label">Menu</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="offcanvas" data-bs-target="#docs-sidebar-menu" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body">
+          <ol id='menu-id-reference-0' class='menu menu-level0 show '>
+            <li id='menu-item-reference-1' class='menu-item '>
+              <span class='menu-item-row'><a href='/NativeWebView/articles/reference/' class='menu-link  '>Reference</a></span>  </li>
+            <li id='menu-item-reference-2' class='menu-item '>
+              <span class='menu-item-row'><a href='/NativeWebView/articles/reference/package-layout/' class='menu-link  '>Package Layout</a></span>  </li>
+            <li id='menu-item-reference-3' class='menu-item '>
+              <span class='menu-item-row'><a href='/NativeWebView/articles/reference/platform-support-matrix/' class='menu-link  '>Platform Support Matrix</a></span>  </li>
+            <li id='menu-item-reference-4' class='menu-item  active'>
+              <span class='menu-item-row'><a href='/NativeWebView/articles/reference/lunet-docs-pipeline/' class='menu-link  '>Lunet Docs Pipeline</a></span>  </li>
+            <li id='menu-item-reference-5' class='menu-item '>
+              <span class='menu-item-row'><a href='/NativeWebView/articles/reference/license/' class='menu-link  '>License</a></span>  </li>
+          </ol>
+
+        </div>
+      </nav>
+      <!-- Right sidebar (TOC) - collapsible on mobile, visible sidebar on xxl+ -->
+      <aside id="docs-sidebar-toc" class="col-12 col-xxl-2 sticky-xxl-top menu-sidebar align-self-start order-0 order-xxl-2 collapse d-xxl-block" aria-expanded="true">
+        <h3 class="toc-title">On this page</h3>
+        <nav class="js-toc"></nav>
+      </aside>
+      <!-- Main content column -->
+      <div class="col-12 col-md-9 col-lg-9 col-xl-9 col-xxl-8 order-2 order-md-1 js-toc-content">
+        <ol class='breadcrumb'>
+          <li class='breadcrumb-item '>
+            <a href='/NativeWebView/' class='breadcrumb-link  '><i class='bi bi-house-door' aria-hidden='true'></i> Home</a>  </li>
+          <li class='breadcrumb-item '>
+            <a href='/NativeWebView/articles/' class='breadcrumb-link  '><i class='bi bi-book' aria-hidden='true'></i> Docs</a>  </li>
+          <li class='breadcrumb-item '>
+            <a href='/NativeWebView/articles/reference/' class='breadcrumb-link  '>Reference</a>  </li>
+          <li class='breadcrumb-item  active'>
+            Lunet Docs Pipeline  </li>
+        </ol>
+
+        <p id="lunet-results"></p>
+        <!-- Toggle buttons visible only on small screens -->
+        <div class="d-md-none mb-3">
+          <button
+            class="btn btn-outline-secondary btn-sm me-2"
+            type="button"
+            data-bs-toggle="offcanvas"
+            data-bs-target="#docs-sidebar-menu"
+            aria-controls="docs-sidebar-menu"
+            aria-label="Toggle docs menu">
+            Menu
+          </button>
+          <button
+            class="btn btn-outline-secondary btn-sm d-xxl-none"
+            type="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#docs-sidebar-toc"
+            aria-controls="docs-sidebar-toc"
+            aria-expanded="false"
+            aria-label="Toggle Table Of Contents">
+            On this page
+          </button>
+        </div>
+<!-- lunet:summarize -->
+<h1 id="lunet-docs-pipeline">Lunet Docs Pipeline</h1>
+<p>This repository uses Lunet for authored documentation and generated .NET API reference.</p>
+<h2 id="site-structure">Site structure</h2>
+<ul>
+<li><code>site/config.scriban</code>: Lunet config, project metadata, base path, and <code>api.dotnet</code> setup</li>
+<li><code>site/menu.yml</code>: top-level navigation</li>
+<li><code>site/readme.md</code>: landing page</li>
+<li><code>site/articles/**</code>: authored documentation pages</li>
+<li><code>site/articles/**/menu.yml</code>: section sidebars</li>
+<li><code>site/images/**</code>: site assets</li>
+<li><code>site/.lunet/css/template-main.css</code>: precompiled template stylesheet (runtime Sass workaround)</li>
+<li><code>site/.lunet/css/site-overrides.css</code>: project-specific styling</li>
+<li><code>site/.lunet/includes/_builtins/bundle.sbn-html</code>: bundle override used by the custom lite bundle</li>
+<li><code>site/.lunet/layouts/**</code>: API layout overrides</li>
+</ul>
+<h2 id="api-generation">API generation</h2>
+<p>The API reference is generated from the shipped projects under <code>src/</code> via <code>with api.dotnet</code> in <code>config.scriban</code>.</p>
+<p>Current API settings:</p>
+<ul>
+<li><code>TargetFramework: net10.0</code></li>
+<li>local API pages generated under <code>/api</code></li>
+<li>package id advertised by the docs site: <code>NativeWebView</code></li>
+<li><code>external_apis</code> mappings for Avalonia assemblies to <code>https://api-docs.avaloniaui.net/docs</code></li>
+</ul>
+<h2 id="styling-and-publish-path">Styling and publish path</h2>
+<p>Lunet <code>1.0.10</code> on macOS 15 has a Dart Sass platform detection issue.
+To keep the full template visual quality:</p>
+<ul>
+<li>docs pages are assigned <code>bundle: &quot;lite&quot;</code> via <code>with attributes</code></li>
+<li>a local <code>/_builtins/bundle.sbn-html</code> override resolves bundle links safely</li>
+<li><code>template-main.css</code> is precompiled and committed, then loaded by the <code>lite</code> bundle</li>
+</ul>
+<p>The production site is published under <code>/NativeWebView</code>, so <code>config.scriban</code> must keep <code>site_project_basepath</code> aligned with the GitHub repository name.</p>
+<h2 id="commands">Commands</h2>
+<p>From repository root:</p>
+<pre><code class="language-bash">./build-docs.sh
+./check-docs.sh
+./serve-docs.sh
+</code></pre>
+<p><code>build-docs.sh</code>/<code>build-docs.ps1</code> clean stale Lunet output and cached <code>NativeWebView*.api.json</code> artifacts before rebuilding, so API/docs output always comes from the current source tree instead of prior build residue.</p>
+<p><code>check-docs.sh</code>/<code>check-docs.ps1</code> build the site and then verify:</p>
+<ul>
+<li>required landing, section, and reference routes exist</li>
+<li>generated output contains no raw <code>.md</code> links or <code>/readme</code> routes</li>
+<li>reference pages do not point at the stale <code>api/index.md</code> path</li>
+<li>landing and article pages do not contain legacy GitHub or Pages URLs from before the rename</li>
+<li>generated asset links do not use the legacy production base path from before the rename</li>
+<li>the footer uses the project MIT license instead of the template Creative Commons footer</li>
+<li>the generated <code>NativeWebView</code> API page keeps its external Avalonia type links</li>
+<li>production pages use the <code>/NativeWebView</code>-prefixed asset paths</li>
+</ul>
+<p><code>serve-docs.sh</code> and <code>serve-docs.ps1</code> print the local URL, auto-select the next free port when <code>DOCS_PORT</code> is already in use, and start from a clean docs output directory before entering watch mode.</p>
+<p>PowerShell:</p>
+<pre><code class="language-powershell">./build-docs.ps1
+./check-docs.ps1
+./serve-docs.ps1
+</code></pre>
+<p>GitHub Actions use <code>check-docs.sh</code> both for PR validation and for the publish workflow, so broken docs links/routes fail before deployment.</p>
+<p>All commands run Lunet in <code>site/</code> and output to <code>site/.lunet/build/www</code>.</p>
+
+      </div>
+  </div>
+</div>
+
+        </section>
+        <footer>
+          <hr>
+          <p>Copyright &copy; 2026, Wieslaw Soltes aka <a href="https://github.com/wieslawsoltes">wieslawsoltes</a> - Content licensed under the <a href="https://github.com/wieslawsoltes/NativeWebView/blob/main/LICENSE">MIT license</a> | Site generated by <a href="https://github.com/lunet-io/lunet">lunet</a> hosted on <a href="https://pages.github.com/">GitHub Pages</a></p>
+        </footer>
+      </div>
+    </div>
+
+  </body>
+</html>
