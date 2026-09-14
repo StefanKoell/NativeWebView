@@ -30,6 +30,7 @@ internal static class MacOSPlatformFeatures
 
     public static IWebViewPlatformFeatures EmbeddedInstance => Create(
         BaseFeatures |
+        NativeWebViewFeature.NavigationCancellation |
         NativeWebViewFeature.DocumentStartScriptInjection |
         NativeWebViewFeature.ZoomFactorChangeNotification);
 

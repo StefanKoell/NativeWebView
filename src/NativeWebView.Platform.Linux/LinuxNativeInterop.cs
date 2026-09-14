@@ -751,6 +751,9 @@ internal static class LinuxNativeInterop
     internal static extern void webkit_settings_set_enable_developer_extras(IntPtr settings, bool enabled);
 
     [DllImport(WebKitName)]
+    internal static extern void webkit_settings_set_enable_javascript(IntPtr settings, bool enabled);
+
+    [DllImport(WebKitName)]
     internal static extern void webkit_settings_set_user_agent(IntPtr settings, [MarshalAs(UnmanagedType.LPUTF8Str)] string? userAgent);
 
     [DllImport(WebKitName)]

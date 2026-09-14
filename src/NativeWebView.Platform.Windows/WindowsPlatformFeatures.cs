@@ -7,6 +7,7 @@ internal static class WindowsPlatformFeatures
     public static readonly IWebViewPlatformFeatures Instance = new WebViewPlatformFeatures(
         NativeWebViewPlatform.Windows,
         NativeWebViewFeature.EmbeddedView |
+        NativeWebViewFeature.NavigationCancellation |
         NativeWebViewFeature.Dialog |
         NativeWebViewFeature.AuthenticationBroker |
         NativeWebViewFeature.DevTools |

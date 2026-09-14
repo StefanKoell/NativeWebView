@@ -1311,6 +1311,9 @@ public sealed class LinuxNativeWebViewBackend
         }
     }
 
+    internal bool IsPageJavaScriptEnabled =>
+        (_preparedControllerOptions ?? _instanceConfiguration.ControllerOptions).IsJavaScriptEnabled;
+
     [SupportedOSPlatform("linux")]
     private void ApplyRuntimeSettingsOnGtkThread()
     {
@@ -1320,6 +1323,7 @@ public sealed class LinuxNativeWebViewBackend
         }
 
         LinuxNativeInterop.webkit_settings_set_enable_developer_extras(_settings, _isDevToolsEnabled);
+        LinuxNativeInterop.webkit_settings_set_enable_javascript(_settings, IsPageJavaScriptEnabled);
         LinuxNativeInterop.webkit_settings_set_user_agent(_settings, _userAgentString);
 
         if (_webView != IntPtr.Zero && _zoomFactor > 0)
