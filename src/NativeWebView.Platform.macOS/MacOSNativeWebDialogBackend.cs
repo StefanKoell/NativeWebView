@@ -140,6 +140,8 @@ public sealed class MacOSNativeWebDialogBackend : INativeWebDialogBackend, INati
     public void ApplyInstanceConfiguration(NativeWebViewInstanceConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
+        if (!configuration.ControllerOptions.IsJavaScriptEnabled)
+            throw new NotSupportedException("Disabling page JavaScript is not supported by the macOS dialog backend. Use an embedded WebView.");
         _instanceConfiguration = configuration.Clone();
     }
 

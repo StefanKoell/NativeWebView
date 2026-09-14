@@ -36,8 +36,33 @@ Option model:
 - `ProfileName`
 - `IsInPrivateModeEnabled`
 - `ScriptLocale`
+- `IsJavaScriptEnabled` (default `true`)
+- `IsPasswordAutosaveEnabled` (default `true`)
+- `IsGeneralAutofillEnabled` (default `true`)
+- `RedactNavigationDetails` (default `false`)
 
 Use this event to configure profile, private-mode, and script-locale behavior where the backend supports it.
+
+### Browser policy options (12.0.4.9)
+
+| Option | Runtime mapping |
+| --- | --- |
+| `IsJavaScriptEnabled` | Applied by Windows, Linux and embedded macOS. The macOS dialog backend rejects `false` with `NotSupportedException`. |
+| `IsPasswordAutosaveEnabled` | Applied to WebView2 password saving on Windows; private profiles always disable password saving there. |
+| `IsGeneralAutofillEnabled` | Applied to WebView2 general autofill on Windows. This is separate from application-provided autofill scripts. |
+| `RedactNavigationDetails` | Omits navigation details from the embedded macOS host's diagnostics. It does not sanitize application logs or arbitrary native-engine output. |
+
+These options are cloned with the instance configuration. The finalized JavaScript
+policy, including changes made in `CoreWebView2ControllerOptionsRequested`, is
+applied before navigation on supported embedded backends. Embedded macOS retains
+that policy when its presenter is replaced. Do not assume password-saving or general
+autofill toggles have native mappings on other platforms merely because the option
+properties exist.
+
+For a private embedded session, configure `IsInPrivateModeEnabled = true` before
+initialization or native attachment. Applications remain responsible for validating
+authentication redirects, limiting script execution to trusted origins and keeping
+credentials and authorization URLs out of their own logs.
 
 ## Per-Instance Proxy Support Matrix
 

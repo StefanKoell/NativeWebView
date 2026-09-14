@@ -103,6 +103,25 @@ PowerShell:
 
 ## Local Packaging and Release Validation
 
+Run the embedded browser regression suites before packaging:
+
+```bash
+dotnet test tests/NativeWebView.Core.Tests/NativeWebView.Core.Tests.csproj
+node --test tests/macos-web-message-bridge.test.mjs
+```
+
+The Node tests execute the production macOS bridge bootstrap and exercise message
+direction, listener cleanup, session isolation and JSON property preservation. They
+require Node.js and are a separate local command; they are not implicitly run by
+`dotnet test`.
+
+For authentication consumers, verify the final package on Windows and macOS with
+redirect interception, interactive sign-in/MFA and federation, application-provided
+autofill, cancellation, process failure, resize/rehosting and profile cleanup. Check
+that disabled context menus and downloads remain disabled. Test after updating all
+consumed NativeWebView packages to the same release version. Unit tests and a source
+build alone do not establish native authentication compatibility.
+
 ```bash
 dotnet build NativeWebView.sln -c Release
 ./scripts/run-platform-diagnostics-report.sh --configuration Release --no-build --platform all --output artifacts/diagnostics/platform-diagnostics-report.json --markdown-output artifacts/diagnostics/platform-diagnostics-report.md --blocking-baseline ci/baselines/blocking-issues-baseline.txt --blocking-baseline-output artifacts/diagnostics/current-blocking-baseline.txt --comparison-markdown-output artifacts/diagnostics/blocking-regression.md --comparison-json-output artifacts/diagnostics/blocking-regression.json --comparison-evaluation-markdown-output artifacts/diagnostics/gate-evaluation.md --require-baseline-sync --allow-not-ready

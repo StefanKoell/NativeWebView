@@ -1422,12 +1422,23 @@ public sealed class WindowsNativeWebViewBackend
         settings.IsStatusBarEnabled = _isStatusBarEnabled;
         settings.IsZoomControlEnabled = _isZoomControlEnabled;
         settings.IsWebMessageEnabled = true;
+        var policy = GetBrowserPolicy();
+        settings.IsScriptEnabled = policy.JavaScript;
+        settings.IsPasswordAutosaveEnabled = policy.PasswordAutosave;
+        settings.IsGeneralAutofillEnabled = policy.GeneralAutofill;
         settings.UserAgent = NormalizeRuntimeUserAgent(_userAgentString);
 
         if (_zoomFactor > 0)
         {
             _controller.ZoomFactor = _zoomFactor;
         }
+    }
+
+    internal (bool JavaScript, bool PasswordAutosave, bool GeneralAutofill) GetBrowserPolicy()
+    {
+        var options = _preparedControllerOptions ?? _instanceConfiguration.ControllerOptions;
+        return (options.IsJavaScriptEnabled, options.IsPasswordAutosaveEnabled && !options.IsInPrivateModeEnabled,
+            options.IsGeneralAutofillEnabled);
     }
 
     internal static string NormalizeRuntimeUserAgent(string? userAgent)
@@ -1443,6 +1454,7 @@ public sealed class WindowsNativeWebViewBackend
         }
 
         _coreWebView.NavigationStarting += OnNavigationStarting;
+        _coreWebView.ProcessFailed += OnProcessFailed;
         _coreWebView.NavigationCompleted += OnNavigationCompleted;
         _coreWebView.WebMessageReceived += OnWebMessageReceived;
         _coreWebView.HistoryChanged += OnHistoryChanged;
@@ -1464,6 +1476,7 @@ public sealed class WindowsNativeWebViewBackend
         if (_coreWebView is not null)
         {
             _coreWebView.NavigationStarting -= OnNavigationStarting;
+            _coreWebView.ProcessFailed -= OnProcessFailed;
             _coreWebView.NavigationCompleted -= OnNavigationCompleted;
             _coreWebView.WebMessageReceived -= OnWebMessageReceived;
             _coreWebView.HistoryChanged -= OnHistoryChanged;
@@ -1593,6 +1606,17 @@ public sealed class WindowsNativeWebViewBackend
             _navigationReplayState.TryUpdateReached(_currentUrl);
         UpdateHistorySnapshot(_coreWebView.CanGoBack, _coreWebView.CanGoForward);
     }
+
+    private void OnProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e)
+    {
+        if (IsTerminalProcessFailure((int)e.ProcessFailedKind))
+            NavigationCompleted?.Invoke(this, new NativeWebViewNavigationCompletedEventArgs(
+                _currentUrl, false, error: "browser-process-failed"));
+    }
+
+    // Use the native enum value at this boundary without requiring consumers to reference WebView2.
+    internal static bool IsTerminalProcessFailure(int kind) =>
+        kind is (int)CoreWebView2ProcessFailedKind.BrowserProcessExited or (int)CoreWebView2ProcessFailedKind.RenderProcessExited;
 
     private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {

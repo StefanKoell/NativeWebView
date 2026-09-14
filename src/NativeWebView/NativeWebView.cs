@@ -46,7 +46,6 @@ public class NativeWebView : NativeControlHost, IDisposable
     private MacOSNativeWebViewHost? _macOSHost;
     private readonly long _presenterId = Interlocked.Increment(ref s_nextPresenterId);
     private int _nativeLayoutRefreshVersion;
-    private int _macOsNavigationReplayVersion;
     private bool _macOSHostEventForwardersAttached;
     private bool _isDisposed;
     private DispatcherTimer? _framePump;
@@ -171,7 +170,7 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     public Uri? Source
     {
-        get => _controller.CurrentUrl;
+        get => CurrentUrl;
         set
         {
             if (value is not null)
@@ -181,13 +180,13 @@ public class NativeWebView : NativeControlHost, IDisposable
         }
     }
 
-    public Uri? CurrentUrl => _controller.CurrentUrl;
+    public Uri? CurrentUrl => _instance.CurrentUrl;
 
     public new bool IsInitialized => _controller.IsInitialized;
 
-    public bool CanGoBack => _controller.CanGoBack;
+    public bool CanGoBack => _instance.CanGoBack;
 
-    public bool CanGoForward => _controller.CanGoForward;
+    public bool CanGoForward => _instance.CanGoForward;
 
     public bool IsDevToolsEnabled
     {
@@ -198,7 +197,12 @@ public class NativeWebView : NativeControlHost, IDisposable
     public bool IsContextMenuEnabled
     {
         get => _controller.IsContextMenuEnabled;
-        set => _controller.IsContextMenuEnabled = value;
+        set
+        {
+            _controller.IsContextMenuEnabled = value;
+            if (_macOSHost is not null)
+                _macOSHost.IsContextMenuEnabled = value;
+        }
     }
 
     /// <summary>Gets or sets whether the browser engine may display its native status UI.</summary>
@@ -795,8 +799,12 @@ public class NativeWebView : NativeControlHost, IDisposable
     private void ForwardCoreWebView2EnvironmentRequested(object? sender, CoreWebViewEnvironmentRequestedEventArgs e) =>
         _coreWebView2EnvironmentRequested?.Invoke(sender, e);
 
-    private void ForwardCoreWebView2ControllerOptionsRequested(object? sender, CoreWebViewControllerOptionsRequestedEventArgs e) =>
+    private void ForwardCoreWebView2ControllerOptionsRequested(object? sender, CoreWebViewControllerOptionsRequestedEventArgs e)
+    {
         _coreWebView2ControllerOptionsRequested?.Invoke(sender, e);
+        if (_controller.Platform == NativeWebViewPlatform.MacOS)
+            _instance.ApplyFinalizedMacOSJavaScriptPolicy(e.Options.IsJavaScriptEnabled);
+    }
 
     private void ForwardFaviconChanged(object? sender, NativeWebViewFaviconChangedEventArgs e) =>
         _faviconChanged?.Invoke(sender, e);
@@ -898,6 +906,8 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     public void Navigate(string url)
     {
+        // Initialize and finalize policy options before the macOS host starts loading content.
+        _controller.Navigate(url);
         if (_macOSHost is not null &&
             Uri.TryCreate(url, UriKind.RelativeOrAbsolute, out var parsedUri) &&
             parsedUri.IsAbsoluteUri)
@@ -905,18 +915,17 @@ public class NativeWebView : NativeControlHost, IDisposable
             _macOSHost.Navigate(parsedUri);
         }
 
-        _controller.Navigate(url);
         UpdateMacOsCompositedPassthroughPolicy();
     }
 
     public void Navigate(Uri uri)
     {
+        _controller.Navigate(uri);
         if (_macOSHost is not null && uri.IsAbsoluteUri)
         {
             _macOSHost.Navigate(uri);
         }
 
-        _controller.Navigate(uri);
         UpdateMacOsCompositedPassthroughPolicy();
     }
 
@@ -967,12 +976,25 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     public Task PostWebMessageAsJsonAsync(string message, CancellationToken cancellationToken = default)
     {
+        if (_controller.Platform == NativeWebViewPlatform.MacOS)
+            return PostMacOSWebMessageAsync(message, true, cancellationToken);
         return _controller.PostWebMessageAsJsonAsync(message, cancellationToken);
     }
 
     public Task PostWebMessageAsStringAsync(string message, CancellationToken cancellationToken = default)
     {
+        if (_controller.Platform == NativeWebViewPlatform.MacOS)
+            return PostMacOSWebMessageAsync(message, false, cancellationToken);
         return _controller.PostWebMessageAsStringAsync(message, cancellationToken);
+    }
+
+    private Task PostMacOSWebMessageAsync(string message, bool isJson, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_isDisposed || _instance.IsDisposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        return _macOSHost is { } host
+            ? host.PostWebMessageAsync(message, isJson, cancellationToken)
+            : throw new InvalidOperationException("The native macOS browser has not been attached.");
     }
 
     public void OpenDevToolsWindow()
@@ -1142,18 +1164,22 @@ public class NativeWebView : NativeControlHost, IDisposable
             if (_macOSHost is not null)
             {
                 AttachMacOSHostEventForwarders();
+                _macOSHost.IsContextMenuEnabled = _controller.IsContextMenuEnabled;
                 _macOSHost.AttachToParent(parent);
                 ApplyRenderModeToNativeHost();
-                ReplayCurrentMacOsNavigationAfterHostAttach();
+                // The retained WKWebView keeps its document, history and in-flight navigation.
+                // AttachToParent resumes pending loads without restarting authentication.
                 return _macOSHost.PlatformHandle;
             }
 
             _controller.TryGetDownloadManager(out var downloadManager);
             _macOSHost = new MacOSNativeWebViewHost(
                 parent,
-                _instance.InstanceConfiguration,
+                _instance.GetMacOSHostConfiguration(),
                 downloadManager as NativeWebViewDownloadManager);
             _instance.MacOSHost = _macOSHost;
+            _instance.NativeNavigationState = _macOSHost;
+            _macOSHost.IsContextMenuEnabled = _controller.IsContextMenuEnabled;
             _instance.CommitInstanceConfiguration();
             AttachMacOSHostEventForwarders();
 
@@ -1346,38 +1372,9 @@ public class NativeWebView : NativeControlHost, IDisposable
 
     private void ReplayMacOsNavigationAfterHostAttach(Uri uri)
     {
-        if (_macOSHost is null || _controller.Platform != NativeWebViewPlatform.MacOS || !OperatingSystem.IsMacOS())
-            return;
-
-        var version = Interlocked.Increment(ref _macOsNavigationReplayVersion);
-        _macOSHost.Navigate(uri);
-
-        Dispatcher.UIThread.Post(
-            () =>
-            {
-                if (ShouldReplayMacOsNavigation(version, uri))
-                    _macOSHost?.Navigate(uri);
-            },
-            DispatcherPriority.Render);
-
-        Dispatcher.UIThread.Post(
-            () =>
-            {
-                if (ShouldReplayMacOsNavigation(version, uri))
-                    _macOSHost?.Navigate(uri);
-            },
-            DispatcherPriority.Background);
+        // The host owns bounded retries and cancellation. Do not post duplicate loads here.
+        _macOSHost?.Navigate(uri);
     }
-
-    private bool ShouldReplayMacOsNavigation(int version, Uri uri)
-    {
-        return !_isDisposed &&
-               version == _macOsNavigationReplayVersion &&
-               _macOSHost is not null &&
-               _controller.CurrentUrl is { } currentUrl &&
-               Uri.Compare(currentUrl, uri, UriComponents.AbsoluteUri, UriFormat.SafeUnescaped, StringComparison.Ordinal) == 0;
-    }
-
     public void Dispose()
     {
         if (_isDisposed)

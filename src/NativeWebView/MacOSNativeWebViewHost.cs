@@ -89,7 +89,7 @@ internal static class MacOSNativeWebViewHostTestHooks
     }
 }
 
-internal sealed class MacOSNativeWebViewHost : IDisposable
+internal sealed class MacOSNativeWebViewHost : IDisposable, INativeNavigationState
 {
     private const string JavaScriptExceptionMessageErrorKey = "WKJavaScriptExceptionMessage";
     private const string DownloadTracePrefix = "NativeWebView.macOS.download";
@@ -313,6 +313,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
 
             ConfigurationHandle = ObjC.SendIntPtr(ObjC.SendIntPtr(NativeSymbols.WKWebViewConfigurationClass, NativeSymbols.SelAlloc), NativeSymbols.SelInit);
             ApplyWebsiteDataStoreConfiguration();
+            SetPageJavaScriptEnabled(_instanceConfiguration.ControllerOptions.IsJavaScriptEnabled);
             InstallUserContentScripts();
             ViewHandle = ObjC.SendIntPtrCGRectIntPtr(
                 ObjC.SendIntPtr(MacOSKeyEquivalentWebView.ClassHandle, NativeSymbols.SelAlloc),
@@ -596,6 +597,16 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         TryLoadOrSchedulePendingNavigation(++_pendingNavigationVersion, attempt: 0);
     }
 
+    internal void SetPageJavaScriptEnabled(bool enabled)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _instanceConfiguration.ControllerOptions.IsJavaScriptEnabled = enabled;
+        var configuration = ViewHandle == IntPtr.Zero
+            ? ConfigurationHandle : ObjC.SendIntPtr(ViewHandle, ObjC.GetSelector("configuration"));
+        var preferences = ObjC.SendIntPtr(configuration, ObjC.GetSelector("preferences"));
+        ObjC.SendVoidByte(preferences, ObjC.GetSelector("setJavaScriptEnabled:"), enabled ? (byte)1 : (byte)0);
+    }
+
     private void TryLoadOrSchedulePendingNavigation(int version, int attempt)
     {
         if (_disposed || version != _pendingNavigationVersion || _pendingNavigationUri is not { } uri)
@@ -607,6 +618,9 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         if (CanLoadNavigation() || attempt >= MaxPendingNavigationAttempts)
         {
             var navigation = TryLoadRequest(uri);
+            // A synchronous policy callback may cancel or replace this request while loadRequest runs.
+            if (_disposed || version != _pendingNavigationVersion || _pendingNavigationUri is null)
+                return;
             if (navigation != IntPtr.Zero)
             {
                 _currentNavigationHandle = navigation;
@@ -697,6 +711,15 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         var navigation = ObjC.SendIntPtrIntPtr(ViewHandle, NativeSymbols.SelLoadRequest, request);
         TraceDownload("navigation.load-request", $"uri={uri.AbsoluteUri}, accepted={navigation != IntPtr.Zero}");
         return navigation;
+    }
+
+    internal bool IsContextMenuEnabled { get; set; } = true;
+
+    internal Task PostWebMessageAsync(string message, bool isJson, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        return ExecuteScriptAsync(MacOSWebMessageBridge.CreateDispatchScript(message, isJson), cancellationToken);
     }
 
     public void Reload()
@@ -1030,7 +1053,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
             _navigationDelegateHandle,
             _webMessageBridgeNameHandle);
         AddUserScript(
-            "globalThis.chrome ??= {}; globalThis.chrome.webview ??= {}; globalThis.chrome.webview.postMessage = value => { const kind = typeof value === 'string' ? 'string' : 'json'; const payload = kind === 'string' ? value : (JSON.stringify(value) ?? 'null'); globalThis.webkit.messageHandlers.nativeWebViewMessage.postMessage(JSON.stringify({ nativeWebViewVersion: 1, kind, payload })); };",
+            MacOSWebMessageBridge.Bootstrap,
             mainFrameOnly: false);
 
         if (_downloadManager is not null)
@@ -1647,24 +1670,36 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
             _navigationDelegateHandle = MacOSWebKitDownloadDelegate.Create(_managedHandle);
     }
 
-    private void DecideNavigationActionPolicy(IntPtr navigationAction, IntPtr decisionHandler)
+    private void DecideNavigationActionPolicy(IntPtr navigationAction, IntPtr decisionHandler) =>
+        NavigationPolicyDecision.Complete(() => ResolveNavigationPolicy(navigationAction),
+            policy => MacOSWebKitDownloadDelegate.InvokePolicyDecision(decisionHandler, policy));
+
+    private void DecideNavigationActionPolicy(IntPtr navigationAction, IntPtr preferences, IntPtr decisionHandler) =>
+        NavigationPolicyDecision.Complete(() => ResolveNavigationPolicy(navigationAction),
+            policy => MacOSWebKitDownloadDelegate.InvokePolicyDecision(decisionHandler, policy, preferences));
+
+    private nint ResolveNavigationPolicy(IntPtr navigationAction)
     {
-        var policy = ShouldDownloadNavigationAction(navigationAction)
+        var pendingVersion = _pendingNavigationVersion;
+        var targetFrame = navigationAction == IntPtr.Zero
+            ? IntPtr.Zero : ObjC.SendIntPtr(navigationAction, NativeSymbols.SelTargetFrame);
+        var isMainFrame = targetFrame != IntPtr.Zero && ObjC.SendBool(targetFrame, ObjC.GetSelector("isMainFrame"));
+        var uri = ResolveNavigationActionUri(navigationAction);
+        if (!NavigationPolicyDecision.IsAllowed(uri, _disposed,
+                args => NavigationStarted?.Invoke(this, args), isMainFrame) || _disposed ||
+            NavigationPolicyDecision.IsSuperseded(pendingVersion, _pendingNavigationVersion))
+        {
+            if (isMainFrame && NavigationPolicyDecision.CancelPending(uri, pendingVersion,
+                    ref _pendingNavigationVersion, ref _pendingNavigationUri))
+            {
+                _acceptedNavigationAwaitingStart = false;
+                _currentNavigationHandle = IntPtr.Zero;
+            }
+            return 0; // WKNavigationActionPolicyCancel
+        }
+        return ShouldDownloadNavigationAction(navigationAction)
             ? MacOSWebKitDownloadDelegate.WKNavigationActionPolicyDownload
             : MacOSWebKitDownloadDelegate.WKNavigationActionPolicyAllow;
-
-        TraceDownload("navigation.action.policy", $"uri={ResolveNavigationActionUri(navigationAction)?.AbsoluteUri ?? "<null>"}, policy={policy}");
-        MacOSWebKitDownloadDelegate.InvokePolicyDecision(decisionHandler, policy);
-    }
-
-    private void DecideNavigationActionPolicy(IntPtr navigationAction, IntPtr preferences, IntPtr decisionHandler)
-    {
-        var policy = ShouldDownloadNavigationAction(navigationAction)
-            ? MacOSWebKitDownloadDelegate.WKNavigationActionPolicyDownload
-            : MacOSWebKitDownloadDelegate.WKNavigationActionPolicyAllow;
-
-        TraceDownload("navigation.action.preferences.policy", $"uri={ResolveNavigationActionUri(navigationAction)?.AbsoluteUri ?? "<null>"}, policy={policy}");
-        MacOSWebKitDownloadDelegate.InvokePolicyDecision(decisionHandler, policy, preferences);
     }
 
     private void DecideNavigationResponsePolicy(IntPtr navigationResponse, IntPtr decisionHandler)
@@ -1741,9 +1776,6 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         var uri = ResolveWebViewUri() ?? _lastNavigationUri ?? _pendingNavigationUri;
         TraceDownload("navigation.did-start", uri?.AbsoluteUri ?? "<null>");
         ClearPendingNavigation(uri);
-        if (uri is not null)
-            NavigationStarted?.Invoke(this, new NativeWebViewNavigationStartedEventArgs(uri, isRedirected: false));
-
         RaiseNavigationHistoryChanged();
     }
 
@@ -2752,9 +2784,15 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
             : null;
     }
 
+    public Uri? CurrentUrl => ResolveWebViewUri();
+
+    public bool CanGoBack => !_disposed && ViewHandle != IntPtr.Zero && ObjC.SendBool(ViewHandle, NativeSymbols.SelCanGoBack);
+
+    public bool CanGoForward => !_disposed && ViewHandle != IntPtr.Zero && ObjC.SendBool(ViewHandle, NativeSymbols.SelCanGoForward);
+
     private Uri? ResolveWebViewUri()
     {
-        if (ViewHandle == IntPtr.Zero)
+        if (_disposed || ViewHandle == IntPtr.Zero)
             return null;
 
         var url = ObjC.SendIntPtr(ViewHandle, NativeSymbols.SelUrl);
@@ -3095,16 +3133,21 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         return _compositedPassthroughEnabled ? 1d : CompositedOverlayAlpha;
     }
 
-    private static void TraceDownload(string stage, string message)
+    private void TraceDownload(string stage, string message)
     {
-        Trace.WriteLine($"{DownloadTracePrefix}.{stage}: {message}");
+        Trace.WriteLine(_instanceConfiguration.ControllerOptions.RedactNavigationDetails
+            ? $"{DownloadTracePrefix}.{stage}"
+            : $"{DownloadTracePrefix}.{stage}: {message}");
     }
+
+    private static void TraceBoundaryDownload(string stage, string message) =>
+        Trace.WriteLine($"{DownloadTracePrefix}.{stage}");
 
     private static void TraceNativeFailure(string stage, Exception exception)
     {
         try
         {
-            Trace.WriteLine($"{NativeTracePrefix}.{stage}: {exception.GetType().Name}: {exception.Message}");
+            Trace.WriteLine($"{NativeTracePrefix}.{stage}: {exception.GetType().Name}");
         }
         catch
         {
@@ -4103,7 +4146,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
 
         public void MarkNativeCanceledForPause()
         {
-            TraceDownload("download.pause.native-cancel", $"download=0x{_download.ToInt64():X}");
+            TraceBoundaryDownload("download.pause.native-cancel", $"download=0x{_download.ToInt64():X}");
         }
 
         public void MarkPauseFailed(string? message, string? code)
@@ -4429,6 +4472,8 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
 
         private static IntPtr MenuForEvent(IntPtr self, IntPtr selector, IntPtr eventHandle)
         {
+            if (GetOwner(self) is not { _disposed: false, IsContextMenuEnabled: true })
+                return IntPtr.Zero;
             var menu = ObjC.SendSuperIntPtrIntPtr(self, NativeSymbols.WKWebViewClass, selector, eventHandle);
             if (menu != IntPtr.Zero)
             {
@@ -4449,14 +4494,14 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         private static void DidCloseMenu(IntPtr self, IntPtr selector, IntPtr menu, IntPtr eventHandle)
         {
             ObjC.SendSuperVoidIntPtrIntPtr(self, NativeSymbols.WKWebViewClass, selector, menu, eventHandle);
-            TraceDownload("context-menu.closed", $"menu=0x{menu.ToInt64():X}");
+            TraceBoundaryDownload("context-menu.closed", $"menu=0x{menu.ToInt64():X}");
         }
 
         private static void NativeDownloadContextLink(IntPtr self, IntPtr selector, IntPtr sender)
         {
             _ = selector;
             var senderTitle = ObjC.StringFromNSString(ObjC.SendIntPtr(sender, NativeSymbols.SelTitle));
-            TraceDownload("context-menu.action", $"sender={senderTitle ?? "<null>"}");
+            TraceBoundaryDownload("context-menu.action", $"sender={senderTitle ?? "<null>"}");
             GetOwner(self)?.StartContextMenuDownload(senderTitle);
         }
 
@@ -4473,7 +4518,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
                 return;
 
             var itemCount = ObjC.SendNInt(menu, NativeSymbols.SelNumberOfItems);
-            TraceDownload("context-menu.enumerate", $"items={itemCount}, contextUri={owner._contextMenuDownloadUri.AbsoluteUri}");
+            TraceBoundaryDownload("context-menu.enumerate", $"items={itemCount}, contextUri={owner._contextMenuDownloadUri.AbsoluteUri}");
             for (nint index = 0; index < itemCount; index++)
             {
                 var item = ObjC.SendIntPtrNInt(menu, NativeSymbols.SelItemAtIndex, index);
@@ -4481,13 +4526,13 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
                     continue;
 
                 var title = ObjC.StringFromNSString(ObjC.SendIntPtr(item, NativeSymbols.SelTitle));
-                TraceDownload("context-menu.item", $"index={index}, title={title ?? "<null>"}");
+                TraceBoundaryDownload("context-menu.item", $"index={index}, title={title ?? "<null>"}");
                 if (!IsDownloadLinkedFileMenuTitle(title))
                     continue;
 
                 ObjC.SendVoidIntPtr(item, NativeSymbols.SelSetTarget, webView);
                 ObjC.SendVoidIntPtr(item, NativeSymbols.SelSetAction, NativeSymbols.SelNativeDownloadContextLink);
-                TraceDownload("context-menu.retarget", title ?? "<null>");
+                TraceBoundaryDownload("context-menu.retarget", title ?? "<null>");
                 return;
             }
 
@@ -4502,11 +4547,11 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
             if (addedItem != IntPtr.Zero)
             {
                 ObjC.SendVoidIntPtr(addedItem, NativeSymbols.SelSetTarget, webView);
-                TraceDownload("context-menu.inject", $"title=Download Linked File, contextUri={owner._contextMenuDownloadUri.AbsoluteUri}");
+                TraceBoundaryDownload("context-menu.inject", $"title=Download Linked File, contextUri={owner._contextMenuDownloadUri.AbsoluteUri}");
             }
             else
             {
-                TraceDownload("context-menu.inject.failed", owner._contextMenuDownloadUri.AbsoluteUri);
+                TraceBoundaryDownload("context-menu.inject.failed", owner._contextMenuDownloadUri.AbsoluteUri);
             }
         }
 
@@ -4582,6 +4627,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
         private static readonly DidStartNavigationDelegate DidStartNavigationCallback = DidStartNavigation;
         private static readonly DidFinishNavigationDelegate DidFinishNavigationCallback = DidFinishNavigation;
         private static readonly DidFailNavigationDelegate DidFailNavigationCallback = DidFailNavigation;
+        private static readonly DownloadDidFinishDelegate WebContentProcessTerminatedCallback = WebContentProcessTerminated;
         private static readonly DecideDestinationDelegate DecideDestinationCallback = DecideDestination;
         private static readonly DownloadDidFinishDelegate DownloadDidFinishCallback = DownloadDidFinish;
         private static readonly DownloadDidFailDelegate DownloadDidFailCallback = DownloadDidFail;
@@ -4803,6 +4849,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
                 "webView:didStartProvisionalNavigation:",
                 DidStartNavigationCallback,
                 "v@:@@");
+            AddMethod(classHandle, "webViewWebContentProcessDidTerminate:", WebContentProcessTerminatedCallback, "v@:@");
             AddMethod(
                 classHandle,
                 "webView:didFinishNavigation:",
@@ -4875,7 +4922,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
             _ = webView;
             var owner = GetOwner(self);
             if (owner is null)
-                InvokePolicyDecision(decisionHandler, WKNavigationActionPolicyAllow);
+                InvokePolicyDecision(decisionHandler, 0);
             else
                 owner.DecideNavigationActionPolicy(navigationAction, decisionHandler);
         }
@@ -4886,7 +4933,7 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
             _ = webView;
             var owner = GetOwner(self);
             if (owner is null)
-                InvokePolicyDecision(decisionHandler, WKNavigationActionPolicyAllow, preferences);
+                InvokePolicyDecision(decisionHandler, 0, preferences);
             else
                 owner.DecideNavigationActionPolicy(navigationAction, preferences, decisionHandler);
         }
@@ -4945,6 +4992,17 @@ internal sealed class MacOSNativeWebViewHost : IDisposable
                 InvokeDownloadDestination(completionHandler, IntPtr.Zero);
             else
                 owner.DecideDownloadDestination(download, response, suggestedFilename, completionHandler);
+        }
+
+        private static void WebContentProcessTerminated(IntPtr self, IntPtr selector, IntPtr webView)
+        {
+            NativeCallbackBoundary.Invoke(() =>
+            {
+                var owner = GetOwner(self);
+                if (owner is not null && !owner._disposed)
+                    owner.NavigationCompleted?.Invoke(owner, new NativeWebViewNavigationCompletedEventArgs(
+                        owner.ResolveWebViewUri(), false, error: "browser-process-failed"));
+            }, exception => TraceNativeFailure("web-content-process.terminated", exception));
         }
 
         private static void DownloadDidFinish(IntPtr self, IntPtr selector, IntPtr download)

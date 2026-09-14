@@ -9,7 +9,7 @@ title: "Platform Support Matrix"
 | Platform | `NativeWebView` control | `NativeWebDialog` | `WebAuthenticationBroker` | Per-instance proxy | Favicon | Downloads |
 | --- | --- | --- | --- | --- | --- |
 | Windows | Implemented | Implemented | Implemented | Implemented | Implemented, including SVG originals via favicon URI | Implemented through WebView2 |
-| macOS | Implemented | Implemented | Implemented | Implemented on macOS 14+ | Not advertised by the current embedded backend | Not advertised; WKDownload bridge pending |
+| macOS | Implemented | Implemented | Implemented | Implemented on macOS 14+ | Advertised; verify the required retrieval path separately | Implemented through the embedded WKDownload bridge |
 | Linux | Implemented | Implemented | Implemented | Implemented | Implemented through document favicon link resolution | Implemented through WebKitGTK |
 | iOS | Implemented when built with the .NET 8 Apple workload | Unsupported | Implemented when built with the .NET 8 Apple workload | Implemented on iOS 17+ when built with the .NET 8 Apple workload | Implemented in the iOS runtime assembly | Unsupported |
 | Android | Implemented when built with the .NET 8 Android workload | Unsupported | Implemented when built with the .NET 8 Android workload | Contract-only, app-wide platform API only | Implemented in the Android runtime assembly | Unsupported |
@@ -22,7 +22,9 @@ Use `NativeWebViewPlatformImplementationStatusMatrix.Get(platform)` to inspect t
 - Registered backend modules and `Features` continue to describe the broader platform capability contract for that engine family.
 - Current repo runtime status is intentionally tracked separately so docs and applications can distinguish stubbed contracts from implemented native host paths.
 - Today, Windows, macOS, and Linux have real embedded `NativeWebView` control hosts in the default desktop build. iOS and Android runtime paths are built from their platform-targeted backend assemblies rather than the default `net10.0` contract build, and the Browser runtime is built from the browser-targeted backend assembly and hosts an `iframe` plus popup/browser-auth integration through Avalonia Browser native control hosting.
-- Download support is currently an in-memory per-view queue on Windows and Linux only. Windows supports native WebView2 pause/resume/cancel capabilities where available; Linux supports WebKitGTK destination, progress, completion/failure, and cancel.
+- Download support includes per-view queues on Windows, Linux and embedded macOS. Windows supports native WebView2 pause/resume/cancel capabilities where available; Linux and macOS provide destination, progress, completion/failure and cancellation handling through their native bridges.
+- `NavigationCancellation` is advertised by Windows and embedded macOS from 12.0.4.9. The macOS dialog and authentication-broker instances do not advertise it; check the actual instance's feature set rather than inferring support from the OS.
+- JavaScript policy is mapped on Windows, Linux and embedded macOS. Password-saving and general autofill options have Windows mappings. See [Controller Options](../rendering/environment-and-controller-options.md) for defaults and limitations.
 
 ## Practical Notes
 

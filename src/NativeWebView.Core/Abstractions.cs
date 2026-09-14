@@ -50,7 +50,9 @@ public enum NativeWebViewFeature
     /// <summary>Captures the visible viewport of an embedded native WebView as an encoded image.</summary>
     EmbeddedSnapshotCapture = 1 << 28,
     /// <summary>Reports native or user-driven changes to the effective zoom factor.</summary>
-    ZoomFactorChangeNotification = 1 << 29
+    ZoomFactorChangeNotification = 1 << 29,
+    /// <summary>Honors synchronous navigation cancellation before native navigation is allowed.</summary>
+    NavigationCancellation = 1 << 30
 }
 
 /// <summary>Specifies which document frames receive a document-start script.</summary>
@@ -414,6 +416,19 @@ public sealed class NativeWebViewEnvironmentOptions
 
 public sealed class NativeWebViewControllerOptions
 {
+    /// <summary>Gets or sets whether page JavaScript is enabled.</summary>
+    /// <remarks>Supported by Windows, Linux and the embedded macOS WebView. The macOS dialog backend rejects disabling JavaScript.</remarks>
+    public bool IsJavaScriptEnabled { get; set; } = true;
+
+    /// <summary>Gets or sets whether the browser may save passwords. Private profiles never save passwords.</summary>
+    public bool IsPasswordAutosaveEnabled { get; set; } = true;
+
+    /// <summary>Gets or sets whether the browser's general autofill is enabled.</summary>
+    public bool IsGeneralAutofillEnabled { get; set; } = true;
+
+    /// <summary>Gets or sets whether native diagnostics omit navigation details.</summary>
+    public bool RedactNavigationDetails { get; set; }
+
     public string? ProfileName { get; set; }
 
     public bool IsInPrivateModeEnabled { get; set; }
@@ -434,6 +449,10 @@ public sealed class NativeWebViewControllerOptions
         options.ProfileName = ProfileName;
         options.IsInPrivateModeEnabled = IsInPrivateModeEnabled;
         options.ScriptLocale = ScriptLocale;
+        options.IsJavaScriptEnabled = IsJavaScriptEnabled;
+        options.IsPasswordAutosaveEnabled = IsPasswordAutosaveEnabled;
+        options.IsGeneralAutofillEnabled = IsGeneralAutofillEnabled;
+        options.RedactNavigationDetails = RedactNavigationDetails;
     }
 }
 

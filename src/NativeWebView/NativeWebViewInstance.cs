@@ -49,6 +49,25 @@ public sealed class NativeWebViewInstance : IDisposable
 
     internal MacOSNativeWebViewHost? MacOSHost { get; set; }
 
+    internal INativeNavigationState? NativeNavigationState { get; set; }
+
+    private bool? _finalizedMacOSJavaScriptEnabled;
+
+    internal NativeWebViewInstanceConfiguration GetMacOSHostConfiguration()
+    {
+        var configuration = InstanceConfiguration.Clone();
+        if (_finalizedMacOSJavaScriptEnabled is { } enabled)
+            configuration.ControllerOptions.IsJavaScriptEnabled = enabled;
+        return configuration;
+    }
+
+    internal void ApplyFinalizedMacOSJavaScriptPolicy(bool enabled)
+    {
+        ObjectDisposedException.ThrowIf(_isDisposed, this);
+        _finalizedMacOSJavaScriptEnabled = enabled;
+        MacOSHost?.SetPageJavaScriptEnabled(enabled);
+    }
+
     internal long ActivePresenterId
     {
         get => Interlocked.Read(ref field);
@@ -63,7 +82,11 @@ public sealed class NativeWebViewInstance : IDisposable
 
     public NativeWebComponentState LifecycleState => Controller.State;
 
-    public Uri? CurrentUrl => Controller.CurrentUrl;
+    public Uri? CurrentUrl => NativeNavigationState is { } native ? native.CurrentUrl : Controller.CurrentUrl;
+
+    internal bool CanGoBack => NativeNavigationState?.CanGoBack ?? Controller.CanGoBack;
+
+    internal bool CanGoForward => NativeNavigationState?.CanGoForward ?? Controller.CanGoForward;
 
     public bool IsInitialized => Controller.IsInitialized;
 
@@ -94,6 +117,7 @@ public sealed class NativeWebViewInstance : IDisposable
         AttachDisposedConfigurationGuard(InstanceConfiguration);
         MacOSHost?.Dispose();
         MacOSHost = null;
+        NativeNavigationState = null;
         Controller.Dispose();
     }
 
