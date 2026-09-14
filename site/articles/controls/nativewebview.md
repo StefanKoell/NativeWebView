@@ -57,6 +57,47 @@ Companion surfaces are available when embedding is not the right fit: [`NativeWe
 
 ## Main Events
 
+### Navigation cancellation and failures
+
+Starting with 12.0.4.9, check
+`Features.Supports(NativeWebViewFeature.NavigationCancellation)` before relying on
+navigation interception. Windows and embedded macOS advertise this capability;
+macOS dialog and authentication-broker instances do not advertise it.
+
+Set `NavigationStarted` event arguments' `Cancel` property synchronously in the
+handler. Posting a decision to the UI dispatcher or awaiting work in the handler
+cannot cancel a navigation that has already been allowed. Attach handlers before
+calling `Navigate`. On embedded macOS, both WebKit policy callback variants honor
+the decision exactly once; subscriber failures, disposal and superseded requests
+cancel the affected navigation. Subframe loads do not raise page-navigation events;
+handle popups separately through `NewWindowRequested`.
+
+Terminal browser-process failures on Windows and embedded macOS are reported through
+`NavigationCompleted` with `IsSuccess = false` and `Error = "browser-process-failed"`.
+Applications should cancel pending browser operations or offer recovery rather than
+waiting indefinitely for an authentication redirect.
+
+### Embedded macOS messaging and state
+
+The page bridge supports `window.chrome.webview.postMessage`,
+`addEventListener("message", handler)` and `removeEventListener("message", handler)`.
+`PostWebMessageAsJsonAsync` delivers parsed JSON in the listener's `event.data`;
+`PostWebMessageAsStringAsync` delivers a string. Host messages are not echoed back as
+managed `WebMessageReceived` events. JSON is decoded as data, including properties
+named `__proto__`.
+
+The macOS native view must be attached before host-to-page messaging; otherwise the
+operation throws `InvalidOperationException`. Cancellation and disposal are honored.
+Each document owns its listeners; register them again after a new document loads.
+
+`Source`, `CurrentUrl`, `CanGoBack` and `CanGoForward` reflect the retained WKWebView.
+Reattaching a presenter preserves its document and history without restarting the
+current navigation. Read control/native state on the UI thread; applications that
+need background access should publish a snapshot. `IsContextMenuEnabled` is applied
+to both newly created and retained native views.
+
+### Event list
+
 - Initialization: `CoreWebView2Initialized`, `CoreWebView2EnvironmentRequested`, `CoreWebView2ControllerOptionsRequested`
 - Browser state: `StatusTextChanged`, `ZoomFactorChanged`, `FaviconChanged`
 - Navigation: `NavigationStarted`, `NavigationCompleted`, `NavigationHistoryChanged`

@@ -52,6 +52,8 @@ End-user installs are typically `NativeWebView` plus the platform package for th
 
 ## Installation
 
+For embedded authentication integrations, see the [navigation and messaging contract](site/articles/controls/nativewebview.md), [browser policy options](site/articles/rendering/environment-and-controller-options.md), and [macOS notes](site/articles/platforms/macos.md). Version 12.0.4.9 adds explicit navigation-cancellation reporting and completes embedded macOS messaging and state preservation. Applications must still verify native sign-in flows with the packaged runtime.
+
 Install the Avalonia control package and the platform backend that matches the runtime you ship:
 
 ```bash
